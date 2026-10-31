@@ -220,34 +220,37 @@ def render_html_email(spec: EmailDraftSpec, category: str = "general_corresponde
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{html.escape(spec.subject)}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+  </style>
 </head>
-<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
   <!-- Preview snippet for email clients -->
   <div style="display: none; max-height: 0px; overflow: hidden; opacity: 0;">
     {html.escape(spec.preview_text)}
   </div>
 
-  <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f1f5f9; padding: 24px 12px;">
+  <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f1f5f9; padding: 32px 12px;">
     <tr>
       <td align="center">
         <!-- Main Card Container -->
-        <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 620px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03); border: 1px solid #e2e8f0;">
+        <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 10px 30px -5px rgba(15, 23, 42, 0.08), 0 0 0 1px rgba(226, 232, 240, 0.8);">
           
           <!-- Top Header Bar -->
           <tr>
-            <td style="background: linear-gradient(135deg, {theme['primary_dark']}, {theme['primary']}); padding: 20px 24px; text-align: left;">
+            <td style="background: linear-gradient(135deg, {theme['primary_dark']}, {theme['primary']}); padding: 32px 32px 28px 32px; text-align: left;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%">
                 <tr>
                   <td>
-                    <span style="display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: 1px; color: #ffffff; text-transform: uppercase; background: rgba(255,255,255,0.2); padding: 4px 10px; border-radius: 20px;">
+                    <span style="display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: 0.08em; color: #ffffff; text-transform: uppercase; background: rgba(255,255,255,0.22); padding: 4px 12px; border-radius: 9999px;">
                       {theme['icon']} {html.escape(spec.badge_title)}
                     </span>
-                    <h1 style="margin: 10px 0 0 0; font-size: 20px; font-weight: 800; color: #ffffff; line-height: 1.3;">
+                    <h1 style="margin: 12px 0 0 0; font-size: 22px; font-weight: 800; color: #ffffff; line-height: 1.3; letter-spacing: -0.02em;">
                       {html.escape(spec.headline)}
                     </h1>
                   </td>
                   <td align="right" style="vertical-align: top;">
-                    <div style="font-size: 12px; font-weight: 700; color: #e0e7ff;">
+                    <div style="font-size: 13px; font-weight: 700; color: #e0e7ff; background: rgba(0,0,0,0.18); padding: 4px 12px; border-radius: 8px;">
                       {html.escape(spec.sender.store_name)}
                     </div>
                   </td>
@@ -258,7 +261,7 @@ def render_html_email(spec: EmailDraftSpec, category: str = "general_corresponde
 
           <!-- Email Content Body -->
           <tr>
-            <td style="padding: 24px 28px;">
+            <td style="padding: 32px 32px 28px 32px;">
               <!-- Salutation -->
               <p style="margin: 0 0 14px 0; font-size: 15px; font-weight: 700; color: #0f172a;">
                 {html.escape(spec.salutation)}
@@ -291,8 +294,9 @@ def render_html_email(spec: EmailDraftSpec, category: str = "general_corresponde
 
           <!-- Footer -->
           <tr>
-            <td style="background-color: #f8fafc; padding: 14px 24px; text-align: center; font-size: 11px; color: #94a3b8; border-top: 1px solid #e2e8f0;">
-              Generated securely via <b>Vyapar Sakha AI</b> for {html.escape(spec.sender.store_name)}.
+            <td style="background-color: #f8fafc; padding: 20px 24px; text-align: center; font-size: 12px; color: #94a3b8; border-top: 1px solid #f1f5f9;">
+              Dispatched with precision via <b>Vyapar Sakha AI</b> for {html.escape(spec.sender.store_name)}.
+              <div style="margin-top: 4px; font-size: 11px; color: #cbd5e1;">© 2026 Vyapar Sakha • Smart Store Automation</div>
             </td>
           </tr>
 
