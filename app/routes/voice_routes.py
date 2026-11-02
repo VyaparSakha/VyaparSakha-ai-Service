@@ -27,6 +27,7 @@ from app.agent.tools.registry import VYAPAR_TOOLS
 from app.agent.nodes.memory_query import _bootstrap_user_memory, _bootstrap_store_memory
 from app.agent.prompts.voice_prompt import build_voice_system_prompt
 _build_voice_system_prompt = build_voice_system_prompt
+from app.agent.tools.visual_builders import build_visual_from_tool
 
 router = APIRouter()
 LOGGER = structlog.get_logger("vyaparsathi.ai.voice")
@@ -945,15 +946,25 @@ async def voice_assistant_websocket(
                                 serialized_result = f"Error executing {fn_name}: {exc}"
                                 result = {"error": serialized_result}
 
+                            # Generate visual spec if tool produced visual-compatible analytics
+                            visual_spec = None
+                            try:
+                                visual_spec = build_visual_from_tool(fn_name, result)
+                            except Exception as v_err:
+                                LOGGER.warning("voice_visual_build_failed", tool=fn_name, error=str(v_err))
+
                             # Notify client that tool execution is complete
                             try:
-                                await websocket.send_json({
+                                tool_complete_payload = {
                                     "type": "tool_complete",
                                     "tool": fn_name,
                                     "label": complete_label,
                                     "args": fn_args,
                                     "result": result,
-                                })
+                                }
+                                if visual_spec:
+                                    tool_complete_payload["visual"] = visual_spec
+                                await websocket.send_json(tool_complete_payload)
                             except Exception as ws_err:
                                 LOGGER.warning("voice_ws_tool_complete_send_failed", error=str(ws_err))
 

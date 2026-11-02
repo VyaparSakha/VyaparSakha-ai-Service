@@ -292,3 +292,7 @@ def build_visual_from_tool(tool_name: str, result: Any) -> Optional[dict]:
             }
 
     return None
+
+
+# Backward-compatible alias
+build_visual_for_tool = build_visual_from_tool
