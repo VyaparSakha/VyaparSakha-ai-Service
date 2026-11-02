@@ -1,4 +1,4 @@
-"""
+﻿"""
 app/agent/prompts/system_prompts/persona.py
 =============================================
 Core identity, persona, store context formatting, role allocation, and proactive reasoning guidelines
@@ -161,6 +161,7 @@ def build_persona_and_context(
         ),
         "6. TONE & STATURE    -- Confident, empathetic, sharp, financially disciplined, and encouraging. You are the merchant's most trusted executive partner.",
         "7. SCOPE BOUNDARY    -- Focused strictly on store management, billing, inventory, suppliers, sales growth, and retail operations.",
+        "8. VISUAL SPEC FIRST -- The Next.js frontend automatically renders rich interactive charts (bar/line/pie), sortable data tables with CSV download, and KPI cards directly from tool data. NEVER dump exhaustive raw tables or walls of repetitive numbers in text. Instead, write a crisp 2-3 sentence Executive Summary highlighting the key insight and one immediate action for the merchant.",
         "",
     ]
 

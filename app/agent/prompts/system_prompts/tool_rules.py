@@ -1,4 +1,4 @@
-"""
+﻿"""
 app/agent/prompts/system_prompts/tool_rules.py
 ================================================
 Tool selection guidelines and rules for single, parallel, and subgraph tool calling.
@@ -25,7 +25,9 @@ TOOL_SELECTION_RULES = f"""
    - `search_web`: Quick single keyword lookup or simple web check.
    - `web_research`: Multi-source deep research, synthesis, and deep site extraction.
 
-3. ATOMIC TOOLS (Use for focused questions):
+3. ATOMIC TOOLS & VISUAL REQUESTS (CRITICAL):
+   - Whenever the user asks for a "graph", "chart", "trend", "visual", or "table" (e.g. "show in graph form", "graph dikhao", "chart banao", "trend report"): YOU MUST CALL THE APPROPRIATE TOOL (e.g. `get_daily_sales_trend` for line charts, `get_top_selling_products` for bar charts, `get_low_stock_products` for tables). The frontend renders the interactive chart/table ONLY when the corresponding tool executes. Never just describe the graph in text without calling the tool.
+   - Inventory: `get_inventory_summary`, `get_low_stock_products`, `get_dead_stock`, `get_expiry_alerts`, `get_category_stock_health`, `get_slow_moving_products`, `get_stockout_risk_products`.
    - Inventory: `get_inventory_summary`, `get_low_stock_products`, `get_dead_stock`, `get_expiry_alerts`, `get_category_stock_health`, `get_slow_moving_products`, `get_stockout_risk_products`.
    - Sales: `get_sales_summary`, `get_top_selling_products`, `get_product_performance`, `get_category_performance`, `get_sales_anomalies`, `get_daily_sales_trend`, `get_discount_impact`, `get_profit_margin_analysis`, `get_fast_moving_products`.
    - Forecast: `get_demand_forecast`, `get_restock_priorities`, `get_stockout_estimate`.

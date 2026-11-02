@@ -1,4 +1,4 @@
-"""
+﻿"""
 app/agent/prompts/system_prompts/tool_synthesis.py
 ===================================================
 Prompt fragment injected when the agent has gathered data from tool calls.
@@ -69,10 +69,10 @@ def build_tool_synthesis(
         f"{doc_download_instruction}"
         "1. You have sufficient tool data to fulfill the user's request. Respond directly WITHOUT calling more tools unless essential data is missing.\n"
         "2. Ground every claim, number, product name, and metric strictly in the gathered context below (<tool_results_gathered>). Never hallucinate product names or stock quantities. Do NOT copy example names (such as Basmati Rice or Tata Salt) from example templates.\n"
-        "3. Format your response into 3 structured sections:\n"
-        "   - **Executive Summary**: 1-2 direct sentences answering the request (include file download link if a document was created).\n"
-        "   - **Key Data & Analysis**: Clear Markdown table or categorized bullet points using risk badges `[CRITICAL]`, `[WARNING]`, `[HEALTHY]` and monetary format `₹`.\n"
-        "   - **Action Recommendations**: Priority-ordered practical next steps for the store owner.\n\n"
+        "3. Format your response into structured sections:\n"
+        "   - **Executive Summary**: 2-3 direct sentences highlighting the key trend, risk, or milestone (plus file download link if a document was created).\n"
+        "   - **Action Recommendations**: Priority-ordered practical next steps for the store owner.\n"
+        "   - Note: The UI automatically renders interactive charts, sortable tables, and KPI cards from tool data. Do NOT repeat every single number or copy giant raw tables into text.\n\n"
         f"{FEW_SHOT_SYNTHESIS}\n\n"
     )
 

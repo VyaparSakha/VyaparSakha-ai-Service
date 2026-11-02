@@ -1,16 +1,16 @@
-"""
+﻿"""
 app/routes/store_ai_routes.py
 ==============================
 FastAPI routes for all AI features scoped to a specific store.
 
 Endpoints:
-    GET  /{store_id}/forecast       â€” demand forecast
-    GET  /{store_id}/restock        â€” restock plan
-    GET  /{store_id}/insights       â€” store insights
-    GET  /{store_id}/summary        â€” store summary
-    GET  /{store_id}/product/{id}   â€” per-product insight
-    POST /{store_id}/copilot        â€” agent-powered Copilot (non-streaming)
-    POST /{store_id}/copilot/stream â€” agent-powered Copilot (streaming SSE)
+    GET  /{store_id}/forecast       — demand forecast
+    GET  /{store_id}/restock        — restock plan
+    GET  /{store_id}/insights       — store insights
+    GET  /{store_id}/summary        — store summary
+    GET  /{store_id}/product/{id}   — per-product insight
+    POST /{store_id}/copilot        — agent-powered Copilot (non-streaming)
+    POST /{store_id}/copilot/stream — agent-powered Copilot (streaming SSE)
 """
 
 import json
@@ -46,12 +46,12 @@ LOGGER = structlog.get_logger("vyaparsathi.ai.copilot_stream")
 
 
 # ---------------------------------------------------------------------------
-# Mutation tool â†’ (refresh_section, navigate_route) mapping
+# Mutation tool → (refresh_section, navigate_route) mapping
 # ---------------------------------------------------------------------------
 # When the agent calls one of these write/delete tools the SSE stream will
 # automatically emit:
-#   1. event: refresh   { section }  â€” UI re-fetches that data section
-#   2. event: navigate  { route }    â€” UI navigates to the relevant page
+#   1. event: refresh   { section }  — UI re-fetches that data section
+#   2. event: navigate  { route }    — UI navigates to the relevant page
 #      (navigate is optional; set to None to skip)
 # Routes use :storeId as a placeholder resolved on the client.
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ class ApiResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Shared SSE streaming helper â€” used by both /copilot/stream and /clarify
+# Shared SSE streaming helper — used by both /copilot/stream and /clarify
 # ---------------------------------------------------------------------------
 
 
@@ -205,23 +205,24 @@ async def _stream_graph_events(
     SSE-formatted strings.
 
     Shared by the ``/copilot/stream`` (new run) and ``/clarify`` (resume)
-    endpoints so interÂ­rupt detection and event handling stay consistent.
+    endpoints so inter­rupt detection and event handling stay consistent.
 
     Yields SSE event strings (``event: token\\ndata: ...\\n\\n`` etc.).
 
     After the generator completes, the mutable ``result`` dict is updated
     with:
-        full_response       â€” accumulated assistant text (may be empty)
-        interrupt_payloads  â€” list of langgraph Interrupt objects (empty
+        full_response       — accumulated assistant text (may be empty)
+        interrupt_payloads  — list of langgraph Interrupt objects (empty
                               if the graph ran to completion)
-        error               â€” set to the error string if an exception
+        error               — set to the error string if an exception
                               was raised inside the generator
     """
     assistant_text_parts: list[str] = []
     interrupt_payloads: list = []
+    visuals_collected: list = []
 
     # Track critic-reflection state to suppress intermediate think responses.
-    # When critic FAILS â†’ reflection â†’ think retries, the intermediate think
+    # When critic FAILS → reflection → think retries, the intermediate think
     # tokens should NOT be streamed since they were rejected. Only the final
     # think pass (after critic PASS or graph end) is shown to the user.
     in_critic_retry: bool = False   # True while inside a reflection-retry cycle
@@ -254,7 +255,7 @@ async def _stream_graph_events(
             if isinstance(chunk, dict) and "__interrupt__" in chunk:
                 for intr in chunk["__interrupt__"]:
                     interrupt_payloads.append(intr)
-                # The stream will end shortly after this event â€” no
+                # The stream will end shortly after this event — no
                 # further processing needed for this event.
                 continue
 
@@ -284,7 +285,7 @@ async def _stream_graph_events(
                 output = data.get("output", {}) or {}
                 critic_status = output.get("goal_status", "")
                 if critic_status in ("complete", "review") and in_critic_retry:
-                    # Critic passed â€” flush buffered tokens to the real stream
+                    # Critic passed — flush buffered tokens to the real stream
                     if pending_text_parts:
                         flushed = "".join(_flatten_text(p) for p in pending_text_parts)
                         # Send as a single replacement token so UI can replace buffered content
@@ -309,7 +310,7 @@ async def _stream_graph_events(
                 if msg_chunk.content:
                     text = _flatten_text(msg_chunk.content)
                     if in_critic_retry:
-                        # Buffer tokens during retry â€” don't stream intermediate rejected answers
+                        # Buffer tokens during retry — don't stream intermediate rejected answers
                         pending_text_parts.append(text)
                     else:
                         assistant_text_parts.append(text)
@@ -342,6 +343,16 @@ async def _stream_graph_events(
                     default=_json_default,
                 )
                 yield f"event: tool_call\ndata: {tool_payload}\n\n"
+
+                # --- Emit visual spec for analytical tools (charts, tables, KPI cards) ---
+                try:
+                    from app.agent.tools.visual_builders import build_visual_from_tool
+                    visual_spec = build_visual_from_tool(name, tool_result) or build_visual_from_tool(name, tool_output)
+                    if visual_spec:
+                        visuals_collected.append(visual_spec)
+                        yield f"event: visual\ndata: {json.dumps(visual_spec, default=_json_default)}\n\n"
+                except Exception as viz_err:
+                    LOGGER.warning("visual_spec_build_failed", tool=name, error=str(viz_err))
 
                 # --- Emit refresh / navigate for mutation tools ---
                 if name in MUTATION_TOOL_MAP:
@@ -454,6 +465,7 @@ async def _stream_graph_events(
             _flatten_text(p) for p in assistant_text_parts
         )
         result["interrupt_payloads"] = interrupt_payloads
+        result["visuals"] = visuals_collected
 
         LOGGER.info(
             "graph_stream_completed",
@@ -474,6 +486,7 @@ async def _stream_graph_events(
         for intr in interrupts:
             interrupt_payloads.append(intr)
         result["interrupt_payloads"] = interrupt_payloads
+        result["visuals"] = visuals_collected
         result["full_response"] = "".join(
             _flatten_text(p) for p in assistant_text_parts
         )
@@ -603,7 +616,7 @@ async def list_chats(store_id: str, request: Request):
 @router.get("/memory/status", response_model=ApiResponse)
 async def get_memory_status():
     """
-    Diagnostic endpoint â€” returns mem0 configuration and health status.
+    Diagnostic endpoint — returns mem0 configuration and health status.
     """
     from app.agent.memory import get_memory_status as _get_status
 
@@ -676,7 +689,7 @@ async def delete_chat(store_id: str, chat_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Copilot â€” agent-powered endpoints
+# Copilot — agent-powered endpoints
 # ---------------------------------------------------------------------------
 
 class CopilotStreamPayload(BaseModel):
@@ -725,13 +738,13 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
 
     async def event_generator():
         try:
-            # â”€â”€ Navigation fast-path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Navigation fast-path ──────────────────────────────────────────
             # Detect explicit "go to X page" style requests and immediately
             # emit a navigate event + friendly reply, bypassing the full graph.
             nav_result = _detect_navigation_intent(payload.message)
             if nav_result:
                 nav_route, nav_label = nav_result
-                reply = f"Sure! Navigating you to the **{nav_label}** page now. ðŸš€"
+                reply = f"Sure! Navigating you to the **{nav_label}** page now. 🚀"
                 yield f"event: token\ndata: {json.dumps({'text': reply})}\n\n"
                 nav_payload = json.dumps({"route": nav_route}, default=_json_default)
                 yield f"event: navigate\ndata: {nav_payload}\n\n"
@@ -742,7 +755,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                 yield f"event: session\ndata: {session_data}\n\n"
                 yield "event: done\ndata: {}\n\n"
                 return
-            # ── End navigation fast-path ──────────────────────────────────────
+            # -- End navigation fast-path --------------------------------------
 
             # Immediately emit session metadata with chat_id at the start of stream
             # so the client can transition URL from /chat to /chat/:chatId right away
@@ -773,7 +786,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
 
             result: dict = {}
 
-            # Stream graph events via the shared helper â€” yields SSE
+            # Stream graph events via the shared helper — yields SSE
             # strings for tokens, tool calls, memory notifications, and
             # error events. Interrupts are captured in result["interrupt_payloads"].
             async for sse in _stream_graph_events(
@@ -790,7 +803,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
             # the stream ends and the interrupt payloads are captured by the
             # helper. We detect this and emit a clarification SSE event.
             #
-            # The graph is now PAUSED (not terminated) â€” the client must
+            # The graph is now PAUSED (not terminated) — the client must
             # call POST /{store_id}/clarify to resume with Command(resume=...).
             interrupt_payloads = result.get("interrupt_payloads", [])
 
@@ -879,6 +892,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                     metadata={
                         "thread_id": thread_id,
                         "grader_denied": grader_denied,
+                        "visuals": result.get("visuals", []),
                     },
                 )
 
@@ -937,7 +951,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
 
 
 # ---------------------------------------------------------------------------
-# Clarify endpoint â€” user responds to a clarification question
+# Clarify endpoint — user responds to a clarification question
 # ---------------------------------------------------------------------------
 
 
@@ -981,7 +995,7 @@ async def clarify(
         user_id=user_id,
     )
 
-    # Resolve the chat session (existing â€” the graph must already be
+    # Resolve the chat session (existing — the graph must already be
     # interrupted on this thread for the resume to work).
     chat_session = await get_or_create_chat_session(
         user_id=user_id,
@@ -1133,7 +1147,7 @@ async def clarify(
                 return
 
             # ----------------------------------------------------------
-            # Normal completion â€” the graph finished without further
+            # Normal completion — the graph finished without further
             # clarification needs.
             # ----------------------------------------------------------
             full_response = result.get("full_response", "")
@@ -1161,7 +1175,7 @@ async def clarify(
                 await add_assistant_message(
                     chat_id,
                     full_response,
-                    metadata={"thread_id": thread_id},
+                    metadata={"thread_id": thread_id, "visuals": result.get("visuals", [])},
                 )
 
             # Emit session metadata
