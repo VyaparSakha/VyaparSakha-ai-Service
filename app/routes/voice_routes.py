@@ -28,6 +28,7 @@ from app.agent.nodes.memory_query import _bootstrap_user_memory, _bootstrap_stor
 from app.agent.prompts.voice_prompt import build_voice_system_prompt
 _build_voice_system_prompt = build_voice_system_prompt
 from app.agent.tools.visual_builders import build_visual_from_tool
+from app.agent.tools.visual_builders import build_visual_for_tool
 
 router = APIRouter()
 LOGGER = structlog.get_logger("vyaparsathi.ai.voice")
@@ -950,6 +951,13 @@ async def voice_assistant_websocket(
                             visual_spec = None
                             try:
                                 visual_spec = build_visual_from_tool(fn_name, result)
+                            except Exception as v_err:
+                                LOGGER.warning("voice_visual_build_failed", tool=fn_name, error=str(v_err))
+
+                            # Generate visual spec if tool produced visual-compatible analytics
+                            visual_spec = None
+                            try:
+                                visual_spec = build_visual_for_tool(fn_name, result)
                             except Exception as v_err:
                                 LOGGER.warning("voice_visual_build_failed", tool=fn_name, error=str(v_err))
 
