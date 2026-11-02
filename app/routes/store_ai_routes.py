@@ -19,7 +19,7 @@ import uuid
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 
 from langgraph.errors import GraphInterrupt
@@ -332,7 +332,13 @@ async def _stream_graph_events(
 
             elif kind == "on_tool_end":
                 tool_output = data.get("output", {})
-                tool_result = getattr(tool_output, "content", tool_output)
+                raw_val = getattr(tool_output, "artifact", None) or getattr(tool_output, "content", tool_output)
+                if hasattr(raw_val, "model_dump"):
+                    tool_result = raw_val.model_dump()
+                elif hasattr(raw_val, "dict") and callable(raw_val.dict):
+                    tool_result = raw_val.dict()
+                else:
+                    tool_result = raw_val
                 tool_payload = json.dumps(
                     {
                         "id": f"tool-{name}-{len(tools_used_set)}",
@@ -576,6 +582,7 @@ class ChatMessageItem(BaseModel):
     role: str
     content: str
     timestamp: str
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatHistoryResponse(BaseModel):
@@ -652,6 +659,7 @@ async def get_chat(store_id: str, chat_id: str, request: Request):
             role=m.role,
             content=m.content,
             timestamp=m.timestamp.isoformat(),
+            meta=m.metadata or {},
         )
         for m in messages
     ]
