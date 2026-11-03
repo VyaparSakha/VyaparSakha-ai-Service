@@ -12,7 +12,7 @@ from typing import Dict, Any
 import structlog
 
 from app.agent.state import VyaparAgentState, make_tool_result
-from app.agent.tools.registry import get_tool_by_name
+from app.agent.tools.registry import get_tool_by_name, is_tool_allowed_for_user
 from pydantic import ValidationError
 
 LOGGER = structlog.get_logger("vyaparsathi.ai.agent.tool")
@@ -46,6 +46,30 @@ async def tool_node(state: VyaparAgentState) -> Dict[str, Any]:
                     tool_name=tool_name,
                     data=None,
                     error=f"Tool '{tool_name}' not found in registry",
+                    loop_index=loop,
+                )
+            )
+            continue
+
+        # RBAC Check: Ensure the tool execution is permitted for user's role & permissions
+        is_owner = state.get("is_owner", True)
+        permissions = state.get("permissions", [])
+        user_role = state.get("user_role", "Owner" if is_owner else "Employee")
+
+        if not is_tool_allowed_for_user(tool_name, is_owner=is_owner, permissions=permissions):
+            LOGGER.warning(
+                "tool_node_permission_denied",
+                tool_name=tool_name,
+                user_role=user_role,
+                is_owner=is_owner,
+                loop=loop,
+            )
+            results.append(
+                make_tool_result(
+                    call_id=call["call_id"],
+                    tool_name=tool_name,
+                    data=None,
+                    error=f"Permission Denied: Your assigned role '{user_role}' does not have permission to execute '{tool_name}'.",
                     loop_index=loop,
                 )
             )

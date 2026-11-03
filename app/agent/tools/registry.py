@@ -289,3 +289,160 @@ def get_tool_by_name(name: str):
         if tool.name == name:
             return tool
     return None
+
+
+# ---------------------------------------------------------------------------
+# RBAC Tool Permission Mappings
+# ---------------------------------------------------------------------------
+
+# Base tools always accessible to any authorized store member
+BASE_TOOLS = {
+    "ask_for_clarification",
+    "tool_navigate_page",
+    "search_products",
+    "get_product_details",
+    "get_product_history",
+    "get_inventory_summary",
+    "search_web",
+    "web_research",
+}
+
+# Billing tools ("billing:create")
+BILLING_TOOLS = {
+    "tool_add_billing_item",
+    "tool_generate_bill",
+    "get_customer_credit_ledger",
+    "search_buyers",
+    "get_buyer_dues",
+    "analyze_customer_credit_risk",
+    "tool_create_buyer",
+    "tool_update_buyer",
+}
+
+# Inventory tools ("inventory:add" or "inventory:manage")
+INVENTORY_TOOLS = {
+    "get_low_stock_products",
+    "get_stock_history",
+    "get_dead_stock",
+    "get_inventory_risk",
+    "get_expiry_alerts",
+    "get_category_stock_health",
+    "get_slow_moving_products",
+    "get_stockout_risk_products",
+    "get_recently_added_products",
+    "search_suppliers",
+    "get_supplier_performance",
+    "get_supplier_pricing",
+    "search_sellers",
+    "tool_create_seller",
+    "tool_update_seller",
+    "get_purchase_summary",
+    "search_purchases",
+    "tool_create_purchase",
+    "tool_receive_purchase",
+    "tool_update_purchase",
+    "parse_supplier_invoice_image",
+    "check_supplier_price_trends",
+    "invoke_deep_inventory_audit",
+    "invoke_smart_restock_order",
+    "get_restock_priorities",
+    "get_stockout_estimate",
+    "calculate_restock_budget",
+    "create_smart_purchase_order",
+    "tool_create_product",
+    "tool_update_product",
+    "tool_adjust_stock",
+}
+
+# Sales analytics & reports tools ("reports:view_sales")
+REPORTS_TOOLS = {
+    "get_sales_summary",
+    "get_top_selling_products",
+    "get_product_performance",
+    "get_category_performance",
+    "get_sales_anomalies",
+    "get_daily_sales_trend",
+    "get_discount_impact",
+    "get_fast_moving_products",
+    "generate_deal_bundle_recommendation",
+    "get_demand_forecast",
+    "get_festival_demand_planner",
+    "get_store_insights",
+    "get_daily_action_checklist",
+    "invoke_morning_briefing",
+    "get_store_baselines",
+    "manage_proactive_insights",
+}
+
+# Owner-only tools (require is_owner == True)
+OWNER_ONLY_TOOLS = {
+    "get_profit_loss_report",
+    "get_profit_margin_analysis",
+    "get_store_goal_progress_report",
+    "get_expense_summary",
+    "tool_create_expense",
+    "tool_update_expense",
+    "tool_delete_expense",
+    "tool_delete_product",
+    "tool_delete_buyer",
+    "tool_delete_seller",
+    "tool_delete_purchase",
+    "tool_create_automation",
+    "tool_list_automations",
+    "tool_toggle_automation",
+    "tool_trigger_automation",
+    "tool_delete_automation",
+    "send_store_email",
+    "compare_stores",
+    "get_store_summary",
+    "invoke_document_generation",
+    "invoke_email_composer",
+    "execute_python_code",
+    "search_memory",
+    "remember_store_fact",
+    "get_owner_goals_and_preferences",
+    "set_owner_goal_or_preference",
+    "write_scratchpad_note",
+    "read_scratchpad_notes",
+    "update_scratchpad_note",
+    "delete_scratchpad_note",
+    "manage_merchant_memories",
+}
+
+
+def get_allowed_tool_names_for_user(is_owner: bool = True, permissions: list[str] | None = None) -> set[str]:
+    """
+    Compute set of tool names accessible to the user based on ownership and assigned permissions.
+    """
+    if is_owner or (permissions and "*" in permissions):
+        return {tool.name for tool in VYAPAR_TOOLS}
+
+    perms = set(permissions or [])
+    allowed = set(BASE_TOOLS)
+
+    if "billing:create" in perms:
+        allowed.update(BILLING_TOOLS)
+
+    if "inventory:add" in perms or "inventory:manage" in perms:
+        allowed.update(INVENTORY_TOOLS)
+
+    if "reports:view_sales" in perms:
+        allowed.update(REPORTS_TOOLS)
+
+    return allowed - OWNER_ONLY_TOOLS
+
+
+def get_tools_for_user(is_owner: bool = True, permissions: list[str] | None = None) -> list:
+    """
+    Returns list of LangChain BaseTool objects that the user is authorized to bind to LLM.
+    """
+    allowed_names = get_allowed_tool_names_for_user(is_owner=is_owner, permissions=permissions)
+    return [tool for tool in VYAPAR_TOOLS if tool.name in allowed_names]
+
+
+def is_tool_allowed_for_user(tool_name: str, is_owner: bool = True, permissions: list[str] | None = None) -> bool:
+    """
+    Validates if a specific tool execution is permitted for defense-in-depth security.
+    """
+    allowed_names = get_allowed_tool_names_for_user(is_owner=is_owner, permissions=permissions)
+    return tool_name in allowed_names

@@ -1,4 +1,4 @@
-﻿"""
+"""
 app/agent/prompts/system_prompts/persona.py
 =============================================
 Core identity, persona, store context formatting, role allocation, and proactive reasoning guidelines
@@ -22,6 +22,9 @@ def build_persona_and_context(
     max_loops: int,
     user_context: dict[str, Any] | None = None,
     store_context: dict[str, Any] | None = None,
+    user_role: str = "Owner",
+    is_owner: bool = True,
+    permissions: list[str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Build the rich persona, store metadata, system time, proactive reasoning protocols,
@@ -40,7 +43,7 @@ def build_persona_and_context(
     current_year_str = str(now.year)
     current_month_str = now.strftime("%B")
 
-    owner_name: str = user_ctx.get("name", "")
+    user_name: str = user_ctx.get("name", "")
     store_name: str = store_ctx.get("name", "")
     business_type: str = store_ctx.get("business_type", "retail")
     city: str = store_ctx.get("city", "")
@@ -49,8 +52,12 @@ def build_persona_and_context(
     low_stock_threshold: int = store_ctx.get("low_stock_threshold", 10)
     lead_time_days: int = store_ctx.get("lead_time_days", 3)
 
+    role_desc = "Store Owner" if is_owner else f"Store Employee (Role: {user_role})"
+    role_line = f"Active User : {user_name or 'User'} | Role: {role_desc}"
+    perms_str = ", ".join(permissions or []) if permissions else "None"
+    perms_line = f"Permissions : {'Full Owner Privileges' if is_owner else perms_str}"
+
     date_line = f"Current Date: {current_day_str}, {current_date_str} (Year {current_year_str}, Month: {current_month_str})"
-    owner_line = f"Store Owner : {owner_name}" if owner_name else ""
     store_id_line = f"Store ID    : {store_id}"
     store_line = f"Store Name  : {store_name}" if store_name else ""
     type_line = f"Store Type  : {business_type.title()} Merchant"
@@ -64,14 +71,14 @@ def build_persona_and_context(
     context_lines = [
         line
         for line in [
-            date_line, owner_line, store_id_line, store_line, type_line, city_line,
+            date_line, role_line, perms_line, store_id_line, store_line, type_line, city_line,
             currency_line, threshold_line,
         ]
         if line
     ]
     context_block = "\n".join(context_lines)
 
-    greeting_name = owner_name if owner_name else "Merchant"
+    greeting_name = user_name if user_name else ("Merchant" if is_owner else user_role)
 
     # Turn-based conversational tone
     is_first_turn = loop == 0

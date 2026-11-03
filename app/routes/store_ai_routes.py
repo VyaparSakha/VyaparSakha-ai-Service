@@ -1,4 +1,4 @@
-﻿"""
+"""
 app/routes/store_ai_routes.py
 ==============================
 FastAPI routes for all AI features scoped to a specific store.
@@ -727,6 +727,11 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
     from app.agent.nodes.think_node import _is_conversation_meaningful
 
     user_id = request.headers.get("x-user-id", "default_user")
+    is_owner_header = request.headers.get("x-is-owner", "true")
+    is_owner = is_owner_header.lower() == "true"
+    user_role = request.headers.get("x-user-role", "Owner" if is_owner else "Employee")
+    permissions_raw = request.headers.get("x-user-permissions", "")
+    permissions = [p.strip() for p in permissions_raw.split(",") if p.strip()]
 
     # Resolve the chat session (existing or new)
     chat_session = await get_or_create_chat_session(
@@ -783,6 +788,9 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                 store_id=store_id,
                 user_prompt=payload.message,
                 thread_id=thread_id,
+                user_role=user_role,
+                is_owner=is_owner,
+                permissions=permissions,
             )
             if payload.language:
                 initial_state["user_preferences"] = {

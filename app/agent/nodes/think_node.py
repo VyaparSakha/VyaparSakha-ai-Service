@@ -14,7 +14,7 @@ import structlog
 from app.agent.state import VyaparAgentState, ToolCall
 from app.lib.llm import get_llm, get_small_llm
 from app.lib.summarizer import summarize
-from app.agent.tools.registry import VYAPAR_TOOLS
+from app.agent.tools.registry import VYAPAR_TOOLS, get_tools_for_user
 from app.agent.prompts.system_prompts import (
     build_agent_base,
     MEMORY_WARNING,
@@ -94,11 +94,17 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
     # Force the LLM to output a direct response (no tools) if we hit the loop ceiling
     is_final_loop = loop >= state.get("max_loops", 3)
     
+    # Filter tools based on user ownership and RBAC permissions
+    is_owner = state.get("is_owner", True)
+    permissions = state.get("permissions", [])
+    user_role = state.get("user_role", "Owner" if is_owner else "Employee")
+    allowed_tools = get_tools_for_user(is_owner=is_owner, permissions=permissions)
+
     if is_final_loop:
         LOGGER.info("think_node_max_loops_reached", loop=loop, store_id=store_id)
         llm_with_tools = llm # No tools bound, forces a text response
     else:
-        llm_with_tools = llm.bind_tools(VYAPAR_TOOLS)
+        llm_with_tools = llm.bind_tools(allowed_tools)
 
     # Build system prompt — richer on later loops to guide synthesis
     tools_called = state.get("tools_called_this_loop", [])
@@ -121,6 +127,9 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
         max_loops=max_loops,
         user_context=state.get("user_context", {}),
         store_context=state.get("store_context", {}),
+        user_role=user_role,
+        is_owner=is_owner,
+        permissions=permissions,
     )
 
     # Inject memory context if available

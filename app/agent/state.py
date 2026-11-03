@@ -152,6 +152,24 @@ class VyaparAgentState(TypedDict):
       - Passed to every inventory/sales/forecast tool call
     """
 
+    user_role: str
+    """
+    Role of the user in this store context (e.g. "Owner", "Cashier", "Manager").
+    Source: ``x-user-role`` HTTP header injected by Express proxy.
+    """
+
+    is_owner: bool
+    """
+    True if the user is the store owner; False if the user is an employee.
+    Source: ``x-is-owner`` HTTP header injected by Express proxy.
+    """
+
+    permissions: list[str]
+    """
+    List of active permission strings assigned to this user for the current store.
+    Source: ``x-user-permissions`` HTTP header injected by Express proxy.
+    """
+
     user_context: dict[str, Any]
     """
     Lightweight snapshot of the authenticated user.
@@ -668,6 +686,9 @@ def make_initial_state(
     store_id: str,
     user_prompt: str,
     thread_id: str | None = None,
+    user_role: str = "Owner",
+    is_owner: bool = True,
+    permissions: list[str] | None = None,
     clarification_history: list[dict[str, Any]] | None = None,
     resume_from_clarification: bool = False,
 ) -> VyaparAgentState:
@@ -681,6 +702,9 @@ def make_initial_state(
         thread_id:   Optional explicit LangGraph checkpoint thread id.
                      If omitted, derived as "{user_id}:{store_id}" — one
                      permanent session per (user, store) pair.
+        user_role:   Role name ("Owner", "Cashier", etc.).
+        is_owner:    Whether the user is the store owner.
+        permissions: List of permission keys granted to this user.
 
     Returns:
         A fully initialized VyaparAgentState ready for graph.invoke().
@@ -696,11 +720,16 @@ def make_initial_state(
     if not thread_id:
         thread_id = f"{user_id}:{store_id}"
 
+    user_permissions = permissions if permissions is not None else (["*"] if is_owner else [])
+
     return VyaparAgentState(
-        # 1. Identity
+        # 1. Identity & RBAC Scope
         user_id=user_id,
         store_id=store_id,
         thread_id=thread_id,
+        user_role=user_role,
+        is_owner=is_owner,
+        permissions=user_permissions,
         # 1b. Runtime context snapshots — populated by context_node
         user_context={},
         store_context={},

@@ -23,6 +23,9 @@ def build_agent_base(
     max_loops: int,
     user_context: dict[str, Any] | None = None,
     store_context: dict[str, Any] | None = None,
+    user_role: str = "Owner",
+    is_owner: bool = True,
+    permissions: list[str] | None = None,
 ) -> str:
     """
     Build the complete system base prompt.
@@ -35,6 +38,9 @@ def build_agent_base(
         max_loops=max_loops,
         user_context=user_context,
         store_context=store_context,
+        user_role=user_role,
+        is_owner=is_owner,
+        permissions=permissions,
     )
 
     parts = [
