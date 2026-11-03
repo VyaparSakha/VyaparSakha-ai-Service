@@ -44,6 +44,7 @@ def build_persona_and_context(
     current_month_str = now.strftime("%B")
 
     user_name: str = user_ctx.get("name", "")
+    owner_name: str = user_name
     store_name: str = store_ctx.get("name", "")
     business_type: str = store_ctx.get("business_type", "retail")
     city: str = store_ctx.get("city", "")
@@ -186,6 +187,9 @@ def build_persona_and_context(
         "low_stock_threshold": low_stock_threshold,
         "lead_time_days": lead_time_days,
         "owner_name": owner_name,
+        "user_name": user_name,
+        "user_role": user_role,
+        "is_owner": is_owner,
     }
     return "\n".join(parts) + "\n", meta
 
