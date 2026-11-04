@@ -66,4 +66,10 @@ TOOL_SELECTION_RULES = f"""
    - In your final response text, ALWAYS summarize what was generated, highlight the key findings, and ALWAYS include a prominent clickable markdown download link:
      `📥 [Download Report ({{filename}})]({{download_url}})`
    - NEVER omit the download URL or claim you cannot provide a link when `download_url` is returned by the tool.
+
+9. DOCUMENT GENERATION POST-PROCESSING & DOWNLOAD LINKS:
+   - When `invoke_document_generation` executes, it returns `file` with `filename` and `download_url`.
+   - In your final response text, ALWAYS summarize what was generated, highlight the key findings, and ALWAYS include a prominent clickable markdown download link:
+     `📥 [Download Report ({{filename}})]({{download_url}})`
+   - NEVER omit the download URL or claim you cannot provide a link when `download_url` is returned by the tool.
 """
