@@ -9,9 +9,7 @@ Rebuilt on every think-node invocation with the latest state.
 from __future__ import annotations
 
 from typing import Any
-from app.agent.prompts.system_prompts.persona import build_persona_and_context
-from app.agent.prompts.system_prompts.tool_rules import TOOL_SELECTION_RULES
-from app.agent.prompts.system_prompts.few_shot_examples import FEW_SHOT_TOOL_DECISIONS
+from app.agent.prompts.system_prompts.dynamic_builder import build_dynamic_agent_base
 
 
 def build_agent_base(
@@ -26,11 +24,16 @@ def build_agent_base(
     user_role: str = "Owner",
     is_owner: bool = True,
     permissions: list[str] | None = None,
+    domains: list[str] | None = None,
 ) -> str:
     """
-    Build the complete system base prompt.
+    Build the complete system base prompt dynamically tailored to active domains.
     """
-    persona_prompt, _meta = build_persona_and_context(
+    if domains is None and user_prompt:
+        from app.agent.tools.clusters import detect_domains
+        domains = detect_domains(user_prompt)
+
+    return build_dynamic_agent_base(
         store_id=store_id,
         user_prompt=user_prompt,
         current_goal=current_goal,
@@ -41,12 +44,5 @@ def build_agent_base(
         user_role=user_role,
         is_owner=is_owner,
         permissions=permissions,
+        domains=domains,
     )
-
-    parts = [
-        persona_prompt,
-        TOOL_SELECTION_RULES,
-        FEW_SHOT_TOOL_DECISIONS,
-    ]
-
-    return "\n".join(parts) + "\n"

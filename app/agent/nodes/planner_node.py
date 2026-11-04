@@ -67,10 +67,11 @@ async def planner_node(state: VyaparAgentState) -> Dict[str, Any]:
 
     LOGGER.info("planner_node_start", store_id=store_id, prompt_len=len(prompt))
 
-    if is_cloudflare_configured():
+    llm = get_planner_llm()
+    if not llm and is_cloudflare_configured():
         llm = getChatModel()
-    else:
-        llm = get_planner_llm() or get_reasoning_llm() or get_small_llm()
+    if not llm:
+        llm = get_reasoning_llm() or get_small_llm()
 
     if not llm:
         LOGGER.error("planner_node_no_llm")

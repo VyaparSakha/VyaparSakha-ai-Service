@@ -237,7 +237,8 @@ async def test_8_preservation_of_langgraph_state():
         content='{"goal": "Audit low stock and recommend restock", "steps": ["1. Check stock", "2. Restock"]}'
     )
 
-    with patch("app.agent.nodes.planner_node.getChatModel") as mock_get_chat:
+    with patch("app.agent.nodes.planner_node.get_planner_llm", return_value=None), \
+         patch("app.agent.nodes.planner_node.getChatModel") as mock_get_chat:
         mock_model = MagicMock()
         mock_model.ainvoke = AsyncMock(return_value=mock_plan_response)
         mock_get_chat.return_value = mock_model
@@ -267,7 +268,8 @@ async def test_8_preservation_of_langgraph_state():
         tool_calls=[],
     )
 
-    with patch("app.agent.nodes.think_node.getChatModel") as mock_get_chat:
+    with patch("app.agent.nodes.think_node.get_llm", return_value=None), \
+         patch("app.agent.nodes.think_node.getChatModel") as mock_get_chat:
         mock_model = MagicMock()
         mock_model.bind_tools = MagicMock(return_value=mock_model)
         mock_model.ainvoke = AsyncMock(return_value=mock_think_response)

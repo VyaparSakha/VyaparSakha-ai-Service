@@ -28,7 +28,6 @@ TOOL_SELECTION_RULES = f"""
 3. ATOMIC TOOLS & VISUAL REQUESTS (CRITICAL):
    - Whenever the user asks for a "graph", "chart", "trend", "visual", or "table" (e.g. "show in graph form", "graph dikhao", "chart banao", "trend report"): YOU MUST CALL THE APPROPRIATE TOOL (e.g. `get_daily_sales_trend` for line charts, `get_top_selling_products` for bar charts, `get_low_stock_products` for tables). The frontend renders the interactive chart/table ONLY when the corresponding tool executes. Never just describe the graph in text without calling the tool.
    - Inventory: `get_inventory_summary`, `get_low_stock_products`, `get_dead_stock`, `get_expiry_alerts`, `get_category_stock_health`, `get_slow_moving_products`, `get_stockout_risk_products`.
-   - Inventory: `get_inventory_summary`, `get_low_stock_products`, `get_dead_stock`, `get_expiry_alerts`, `get_category_stock_health`, `get_slow_moving_products`, `get_stockout_risk_products`.
    - Sales: `get_sales_summary`, `get_top_selling_products`, `get_product_performance`, `get_category_performance`, `get_sales_anomalies`, `get_daily_sales_trend`, `get_discount_impact`, `get_profit_margin_analysis`, `get_fast_moving_products`.
    - Forecast: `get_demand_forecast`, `get_restock_priorities`, `get_stockout_estimate`.
    - Memory: `search_memory` (Use only when retrieving past owner preferences or historical decisions not present in bootstrap context).
@@ -60,12 +59,6 @@ TOOL_SELECTION_RULES = f"""
    - `tool_toggle_automation`: Use to pause or resume an automation rule (`status='ACTIVE'` or `'PAUSED'`).
    - `tool_trigger_automation`: Use to run an existing automation immediately out-of-schedule ("Run low stock alert right now").
    - `tool_delete_automation`: Use to remove an automation rule and its schedule permanently.
-
-9. DOCUMENT GENERATION POST-PROCESSING & DOWNLOAD LINKS:
-   - When `invoke_document_generation` executes, it returns `file` with `filename` and `download_url`.
-   - In your final response text, ALWAYS summarize what was generated, highlight the key findings, and ALWAYS include a prominent clickable markdown download link:
-     `📥 [Download Report ({{filename}})]({{download_url}})`
-   - NEVER omit the download URL or claim you cannot provide a link when `download_url` is returned by the tool.
 
 9. DOCUMENT GENERATION POST-PROCESSING & DOWNLOAD LINKS:
    - When `invoke_document_generation` executes, it returns `file` with `filename` and `download_url`.

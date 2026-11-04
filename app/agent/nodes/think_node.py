@@ -94,10 +94,9 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
     if isinstance(user_prompt, str) and not user_prompt.strip() and not raw_msgs:
         raise ValueError("User message cannot be empty.")
 
-    if is_cloudflare_configured():
+    llm = get_llm()
+    if not llm and is_cloudflare_configured():
         llm = getChatModel()
-    else:
-        llm = get_llm()
 
     if not llm:
         LOGGER.error("think_node_no_llm", store_id=store_id)
@@ -164,6 +163,7 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
         user_role=user_role,
         is_owner=is_owner,
         permissions=permissions,
+        domains=domains,
     )
 
     # Inject memory context if available

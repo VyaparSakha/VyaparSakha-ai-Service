@@ -14,8 +14,8 @@ from app.agent.state import VyaparAgentState
 from app.agent.utils import latest_human_prompt
 from app.lib.grader import _SEVERE_HARM_KEYWORDS
 from app.lib.llm import get_intent_llm, get_small_llm
-from app.agent.tools.clusters import detect_domains
-from langchain_core.messages import AIMessage
+from app.agent.tools.clusters import detect_domains, _CONVERSATIONAL_PATTERNS
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 
 LOGGER = structlog.get_logger("vyaparsathi.ai.agent.intent")
 
@@ -67,69 +67,54 @@ _COMPLEX_TERMS = (
     "best products", "analyze", "prioritize"
 )
 
-_GREETING_REPLIES = [
-    "Hello! 👋 I'm Vyapar Sakha. How can I help with your store today?",
-    "Hi there! 😊 Ready to help with your inventory, sales, or restocking. What do you need?",
-    "Hey! Welcome back. Ask me anything about your store — inventory, sales, forecasts, and more.",
-    "Hello! How can I assist you with your store operations today?",
-    "Hi! 👋 I'm here to help. Ask me about your inventory, sales trends, or store insights.",
-]
-
-_FAREWELL_TERMS = {"good night", "goodnight", "bye", "goodbye", "good bye", "see you", "cya", "take care", "ttyl", "gn"}
-_THANKS_TERMS = {"thanks", "thank you", "thankyou", "thx", "ty", "great", "awesome", "perfect", "nice", "good", "ok thanks", "okay thanks"}
-_OPENER_TERMS = {"hi", "hello", "hey", "hii", "helo", "hola", "good morning", "good evening", "good afternoon", "howdy", "sup", "how are you", "how r u"}
-
-_FAREWELL_REPLIES = [
-    "Good night! 🌙 Rest well. I'll be here when you need me.",
-    "Good night! 🌙 Take care. Come back anytime your store needs attention.",
-    "Bye! 👋 See you next time. Vyapar Sakha is always ready.",
-]
-_THANKS_REPLIES = [
-    "You're welcome! 😊 Let me know if there's anything else I can help with.",
-    "Happy to help! 🙌 Anything else about your store?",
-    "Glad I could help! Ask me anytime. 😊",
-]
-_OPENER_REPLIES = [
-    "Hello! 👋 I'm Vyapar Sakha. How can I help with your store today?",
-    "Hi there! 😊 Ready to help with your inventory, sales, or restocking.",
-    "Hey! Ask me anything about your store — inventory, sales, forecasts, and more.",
-    "Hello! How can I assist with your store operations today?",
-]
-
-def _build_greeting_reply(state: VyaparAgentState, prompt: str) -> str:
-    """Build a contextually correct reply by analysing the actual greeting prompt."""
-    lowered = (prompt or "").lower().strip().rstrip("!.,?")
-    messages = state.get("messages", [])
-    prior_msgs = [m for m in messages[:-1] if hasattr(m, "type") and m.type in ("human", "ai")]
-    is_returning = bool(prior_msgs)
-
-    # Get user's first name if available for personalization
+async def _generate_conversational_reply(state: VyaparAgentState, prompt: str) -> str:
+    """Generate a warm, natural, personalized greeting using the fast LLM tier (Groq 20B / Gemini Lite)."""
     user_ctx = state.get("user_context") or {}
-    name = (user_ctx.get("name") or "").split()[0] if user_ctx.get("name") else ""
-    name_part = f", {name}" if name else ""
+    store_ctx = state.get("store_context") or {}
+    merchant_name = user_ctx.get("name") or "Merchant"
+    first_name = merchant_name.split()[0] if merchant_name else "Merchant"
+    store_name = store_ctx.get("name") or "Store"
+    business_type = store_ctx.get("business_type") or "retail"
 
-    # Farewell
-    if any(lowered == t or lowered.startswith(t) for t in _FAREWELL_TERMS):
-        reply = random.choice(_FAREWELL_REPLIES)
-        if name:
-            reply = reply.replace("!", f"{name_part}!", 1)
-        return reply
+    sys_prompt = (
+        f"You are Vyapar Sakha (व्यापार सखा), the trusted AI retail co-pilot and fractional CFO for Indian store owners.\n"
+        f"Active Merchant: {merchant_name}\n"
+        f"Store: {store_name} ({business_type.title()} Merchant)\n\n"
+        f"Greet the merchant respectfully and warmly in natural, friendly Hinglish/Hindi (or English matching the query).\n"
+        f"Address them respectfully as 'Namaste {first_name} ji!'.\n"
+        f"Directly answer their query (e.g. if they asked 'kaise ho', answer how you are doing, ask how their vyapar/store is going, "
+        f"and offer help with sales, inventory, or billing).\n"
+        f"Keep it concise, natural, and friendly (1-3 sentences max). Do NOT invent database numbers. Do NOT sound robotic."
+    )
 
-    # Thanks / acknowledgment
-    if any(lowered == t or lowered.startswith(t) for t in _THANKS_TERMS):
-        return random.choice(_THANKS_REPLIES)
+    llm = get_intent_llm() or get_small_llm()
+    if not llm:
+        return f"Namaste {first_name} ji! Main theek hoon. Aapke store ke liye aaj kya madad kar sakta hoon?"
 
-    # Opening greeting — differentiate returning vs new session
-    if is_returning:
-        return f"Welcome back{name_part}! 😊 How can I help you with your store today?"
-
-    return random.choice(_OPENER_REPLIES)
+    try:
+        messages = [
+            SystemMessage(content=sys_prompt),
+            HumanMessage(content=prompt),
+        ]
+        res = await asyncio.wait_for(
+            llm.ainvoke(messages, config={"tags": ["hide_stream"]}),
+            timeout=5.0,
+        )
+        content = res.content if hasattr(res, "content") else str(res)
+        text = str(content).strip()
+        if text:
+            return text
+        return f"Namaste {first_name} ji! Main theek hoon. Aapka vyapar kaisa chal raha hai? Sales ya inventory me koi madad chahiye toh batayein."
+    except Exception as exc:
+        LOGGER.warning("intent_greeting_llm_failed", error=str(exc)[:150])
+        return f"Namaste {first_name} ji! Main theek hoon. Aapka vyapar kaisa chal raha hai? Sales ya inventory me koi madad chahiye toh batayein."
 
 
 class IntentClassification(BaseModel):
     intent: str = Field(description="The primary intent label: harmful, off_topic, live_data, memory, conversation_recap, mixed, greeting, or general")
-    reason: str = Field(description="Short reason for the classification")
-    requires_planning: bool = Field(description="True if the request is complex and needs step-by-step planning or strategy")
+    domains: list[str] = Field(default_factory=list, description="Active business domain(s): sales, inventory, forecast, suppliers_purchases, buyers_credit, finance_expenses, billing, documents, communication, automations, insights_overview, web, or [] for conversational")
+    requires_planning: bool = Field(default=False, description="True ONLY if the request is complex, multi-step, or strategic requiring a formal step-by-step plan. False for direct data queries like 'tell me about last 30 day sells' or 'low stock alert'")
+    reason: str = Field(description="Short operational rationale for the classification and domain selection")
 
 
 def _requires_planning(prompt: str) -> bool:
@@ -168,11 +153,9 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
         state.get("messages", []),
         state.get("user_prompt", ""),
     ).strip()
-    
-    requires_planning = _requires_planning(prompt)
+    lowered = prompt.lower()
 
-    # When resuming after a clarification, the intent was
-    # already determined — reuse it directly.
+    # 1. Resuming after a clarification: reuse determined intent directly
     if state.get("resume_from_clarification", False):
         existing_intent = state.get("intent", "general") or "general"
         existing_reason = state.get("intent_reason", "") or "resumed from clarification"
@@ -183,6 +166,7 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
         )
         needs_memory = existing_intent in _MEMORY_REQUIRED_INTENTS
         domains = state.get("domains") or detect_domains(prompt)
+        requires_planning = state.get("requires_planning", False)
         return {
             "user_prompt": prompt,
             "intent": existing_intent,
@@ -195,80 +179,40 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "requires_planning": requires_planning,
         }
 
-    deterministic = _deterministic_intent(prompt)
-    reason = "deterministic routing"
-    intent = deterministic
-
-    if intent is None and prompt:
-        llm = get_intent_llm() or get_small_llm()
-        if llm:
-            try:
-                # Build context from last 6 messages (3 full user+assistant turns)
-                history_context = ""
-                messages = state.get("messages", [])
-                if len(messages) > 1:
-                    # Get last 7 messages excluding the very latest (which is the current prompt)
-                    recent_msgs = [m for m in messages[-7:-1] if hasattr(m, "type") and m.type in ("human", "ai")]
-                    history_lines = []
-                    for m in recent_msgs:
-                        role = "User" if m.type == "human" else "Assistant"
-                        content = m.content if isinstance(m.content, str) else str(m.content)
-                        history_lines.append(f"{role}: {content[:300]}")
-                    if history_lines:
-                        history_context = "Recent Conversation (last 3 turns):\n" + "\n".join(history_lines) + "\n\n"
-                        
-                classifier = llm.with_structured_output(IntentClassification)
-                messages = [
-                    {"role": "system", "content": INTENT_CLASSIFIER_INSTRUCTION},
-                    {"role": "user", "content": f"{history_context}Latest User Request: {prompt}"},
-                ]
-                response = await asyncio.wait_for(
-                    classifier.ainvoke(messages, config={"tags": ["hide_stream"]}),
-                    timeout=6.0,
-                )
-                
-                if response.intent in _VALID_INTENTS:
-                    intent = response.intent
-                    reason = response.reason
-                    requires_planning = requires_planning or response.requires_planning
-                else:
-                    intent = "general"
-                    reason = "invalid intent from LLM"
-            except asyncio.TimeoutError:
-                LOGGER.warning("intent_classification_timeout", error="LLM timeout after 6s")
-                intent = "general"
-                reason = "LLM classification timeout"
-            except Exception as e:
-                LOGGER.warning("intent_classification_failed", error=str(e))
-                intent = "general"
-                reason = "LLM classification failed"
-
-    intent = intent or "general"
-    # Only load memory when the intent genuinely requires it.
-    # live_data / general / conversation_recap queries don't need historical memory;
-    # the actual data comes from live tools. This is the primary knob that prevents
-    # the 25-second memory_query delay for ~80% of requests.
-    needs_memory = intent in _MEMORY_REQUIRED_INTENTS
-
-    LOGGER.info(
-        "intent_classified",
-        intent=intent,
-        reason=reason,
-        needs_memory=needs_memory,
-        prompt_len=len(prompt),
-        requires_planning=requires_planning,
-    )
-
-    # ── Greeting fast-path ─────────────────────────────────────────────────
-    # Skip memory_query, think, and all heavy nodes entirely.
-    # Generate a contextual reply from checkpointer history right here.
-    if intent == "greeting":
-        reply = _build_greeting_reply(state, prompt)
-        LOGGER.info("intent_greeting_fast_path", reply_len=len(reply))
+    # 2. Fast-path: Severe harm screening
+    if any(kw in lowered for kw in _SEVERE_HARM_KEYWORDS):
+        LOGGER.warning("intent_severe_harm_refusal", prompt=prompt[:50])
         return {
             "user_prompt": prompt,
-            "intent": intent,
-            "intent_reason": reason,
+            "intent": "harmful",
+            "intent_reason": "severe harm keyword detected",
+            "domains": [],
+            "memory_query_needed": False,
+            "user_memory_loaded": True,
+            "store_memory_loaded": True,
+            "multi_store_memory_loaded": True,
+            "requires_planning": False,
+            "grader_denied": True,
+            "grader_reason": "severe harm keyword detected",
+            "goal_status": "complete",
+            "goal": "refuse harmful request",
+            "final_answer": _REFUSAL_HARMFUL,
+            "should_persist_memory": False,
+            "messages": [AIMessage(content=_REFUSAL_HARMFUL)],
+            "response_metadata": {"intent": "harmful", "fast_path": True},
+        }
+
+    # 3. Fast-path: Pure conversational greeting / pleasantry answered directly via fast LLM
+    has_business_terms = any(kw in lowered for kw in ("stock", "sale", "sell", "due", "khata", "bill", "report", "order", "product", "inventory"))
+    if _CONVERSATIONAL_PATTERNS.search(prompt) and not has_business_terms:
+        LOGGER.info("intent_conversational_llm_start", prompt=prompt[:50])
+        reply = await _generate_conversational_reply(state, prompt)
+        LOGGER.info("intent_conversational_llm_answered", reply_len=len(reply))
+        return {
+            "user_prompt": prompt,
+            "intent": "greeting",
+            "intent_reason": "conversational greeting answered directly by LLM",
+            "domains": [],
             "memory_query_needed": False,
             "user_memory_loaded": True,
             "store_memory_loaded": True,
@@ -279,9 +223,99 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "final_answer": reply,
             "should_persist_memory": False,
             "messages": [AIMessage(content=reply)],
-            "response_metadata": {"intent": "greeting", "fast_path": True},
+            "response_metadata": {"intent": "greeting", "fast_path": True, "generated_by": "intent_llm"},
         }
-    # ── End greeting fast-path ─────────────────────────────────────────────
+
+    # 4. Multi-Tier LLM Classification with automatic fallback (Groq 20B -> Cloudflare GLM -> Gemini)
+    intent = None
+    reason = ""
+    domains: list[str] = []
+    requires_planning = False
+
+    llm = get_intent_llm() or get_small_llm()
+    if llm and prompt:
+        try:
+            # Build context from last 6 messages (3 full user+assistant turns)
+            history_context = ""
+            messages = state.get("messages", [])
+            if len(messages) > 1:
+                recent_msgs = [m for m in messages[-7:-1] if hasattr(m, "type") and m.type in ("human", "ai")]
+                history_lines = []
+                for m in recent_msgs:
+                    role = "User" if m.type == "human" else "Assistant"
+                    content = m.content if isinstance(m.content, str) else str(m.content)
+                    history_lines.append(f"{role}: {content[:300]}")
+                if history_lines:
+                    history_context = "Recent Conversation (last 3 turns):\n" + "\n".join(history_lines) + "\n\n"
+
+            classifier = llm.with_structured_output(IntentClassification)
+            messages_payload = [
+                {"role": "system", "content": INTENT_CLASSIFIER_INSTRUCTION},
+                {"role": "user", "content": f"{history_context}Latest User Request: {prompt}"},
+            ]
+            response = await asyncio.wait_for(
+                classifier.ainvoke(messages_payload, config={"tags": ["hide_stream"]}),
+                timeout=8.0,
+            )
+
+            if response.intent in _VALID_INTENTS:
+                intent = response.intent
+                reason = response.reason
+                domains = getattr(response, "domains", []) or []
+                requires_planning = bool(getattr(response, "requires_planning", False))
+            else:
+                intent = "general"
+                reason = "unrecognized intent from LLM"
+        except asyncio.TimeoutError:
+            LOGGER.warning("intent_classification_timeout", error="LLM timeout after 8s")
+        except Exception as e:
+            LOGGER.warning("intent_classification_failed", error=str(e)[:200])
+
+    # 5. Deterministic fallback if LLM classification did not yield an intent
+    if not intent:
+        intent = _deterministic_intent(prompt) or "general"
+        reason = "deterministic fallback routing"
+        requires_planning = _requires_planning(prompt)
+
+    # 6. Ensure domain list is populated via pattern detection if empty
+    if not domains:
+        domains = [] if intent in {"greeting", "harmful", "off_topic"} else detect_domains(prompt)
+
+    intent = intent or "general"
+    needs_memory = intent in _MEMORY_REQUIRED_INTENTS
+
+    LOGGER.info(
+        "intent_classified",
+        intent=intent,
+        reason=reason,
+        domains=domains,
+        needs_memory=needs_memory,
+        prompt_len=len(prompt),
+        requires_planning=requires_planning,
+    )
+
+    # 7. Greeting / Harmful / Off-topic handling
+    if intent == "greeting":
+        LOGGER.info("intent_greeting_llm_start", prompt=prompt[:50])
+        reply = await _generate_conversational_reply(state, prompt)
+        LOGGER.info("intent_greeting_llm_answered", reply_len=len(reply))
+        return {
+            "user_prompt": prompt,
+            "intent": intent,
+            "intent_reason": reason,
+            "domains": [],
+            "memory_query_needed": False,
+            "user_memory_loaded": True,
+            "store_memory_loaded": True,
+            "multi_store_memory_loaded": True,
+            "requires_planning": False,
+            "goal_status": "complete",
+            "goal": "greet user",
+            "final_answer": reply,
+            "should_persist_memory": False,
+            "messages": [AIMessage(content=reply)],
+            "response_metadata": {"intent": "greeting", "fast_path": True, "generated_by": "intent_llm"},
+        }
 
     if intent in {"harmful", "off_topic"}:
         reply = _REFUSAL_HARMFUL if intent == "harmful" else _REFUSAL_OFF_TOPIC
@@ -290,6 +324,7 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "user_prompt": prompt,
             "intent": intent,
             "intent_reason": reason,
+            "domains": [],
             "memory_query_needed": False,
             "user_memory_loaded": True,
             "store_memory_loaded": True,
@@ -305,7 +340,7 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "response_metadata": {"intent": intent, "fast_path": True, "grader_verdict": intent},
         }
 
-    domains = [] if intent in {"greeting", "harmful", "off_topic"} else detect_domains(prompt)
+    # 8. Standard active business query
     return {
         "user_prompt": prompt,
         "intent": intent,

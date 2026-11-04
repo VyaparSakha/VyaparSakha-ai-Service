@@ -86,6 +86,33 @@ def _build_ollama(model: str, *, base_url: str = "http://localhost:11434/v1", ap
     return _build_openai(model, base_url=base_url, api_key=api_key or "ollama")
 
 
+def _build_cloudflare(model: str = "@cf/zai-org/glm-4.7-flash", *, api_key: str | None = None, **kwargs) -> Any:
+    """Build a ChatOpenAI instance pointed at Cloudflare Workers AI."""
+    settings = get_settings()
+    account_id = (
+        settings.cloudflare_ai_account_id
+        or settings.cloudflare_account_id
+        or os.getenv("CLOUDFLARE_AI_ACCOUNT_ID")
+        or os.getenv("CLOUDFLARE_ACCOUNT_ID")
+    )
+    token = (
+        api_key
+        or settings.cloudflare_ai_api_token
+        or settings.cloudflare_api_token
+        or os.getenv("CLOUDFLARE_AI_API_TOKEN")
+        or os.getenv("CLOUDFLARE_API_TOKEN")
+    )
+    if not account_id or not token:
+        raise ValueError("Cloudflare AI credentials not configured (CLOUDFLARE_AI_ACCOUNT_ID, CLOUDFLARE_AI_API_TOKEN).")
+    base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+    return _build_openai(
+        model,
+        base_url=base_url,
+        api_key=token,
+        default_headers={"User-Agent": "VyaparSakha/1.0"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Provider Definitions by Architectural Group
 # ---------------------------------------------------------------------------
@@ -98,11 +125,13 @@ _OPENAI_BASE_URL = {
 
 # 1. Reasoning & Strategic Thinking (think_node, synthesis)
 _REASONING_PROVIDERS = [
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/google/gemma-4-26b-a4b-it", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
@@ -110,10 +139,12 @@ _REASONING_PROVIDERS = [
 # 1b. Planner Tier (planner_node) - Prioritizes large 120B reasoning models for generating plans
 _PLANNER_PROVIDERS = [
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/google/gemma-4-26b-a4b-it", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
@@ -121,12 +152,15 @@ _PLANNER_PROVIDERS = [
 # Legacy alias for backward compatibility
 _LARGE_PROVIDERS = _REASONING_PROVIDERS
 
-# 2. Intent Routing (intent_node)
+# 2. Intent Routing (intent_node) - Ultra-fast Groq 20B / Cloudflare GLM primary, Gemini fallback
 _INTENT_PROVIDERS = [
-    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
-    ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
+    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
+    ("cloudflare", "@cf/google/gemma-4-26b-a4b-it", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
@@ -135,6 +169,7 @@ _INTENT_PROVIDERS = [
 # Non-Gemini primary (Groq 120B / 20B / Qwen) to conserve Gemini rate limits
 _CRITIC_PROVIDERS = [
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
@@ -143,8 +178,9 @@ _CRITIC_PROVIDERS = [
 ]
 
 # 4. Fast Auxiliary & Memory (memory extraction, retrieval rerank, conflict resolution, summarizer)
-# Non-Gemini primary: Groq 20B (ultra fast), Groq Qwen 27B
+# Non-Gemini primary: Groq 20B (ultra fast), Groq Qwen 27B, Cloudflare GLM
 _SMALL_PROVIDERS = [
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("openrouter", "google/gemma-2-9b-it:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
@@ -459,27 +495,6 @@ class _FallbackLLM:
         elif new_builders:
             new_members[0] = new_builders[0]()
         return _FallbackLLM(new_members, new_names, new_builders)
-        for b in self._builders:
-            def _make_structured_builder(builder=b):
-                instance = builder()
-                if hasattr(instance, "with_structured_output"):
-                    try:
-                        return instance.with_structured_output(schema, **kwargs)
-                    except Exception as e:
-                        LOGGER.warning("with_structured_output_failed_on_member", error=str(e)[:150])
-                        return instance
-                return instance
-            new_builders.append(_make_structured_builder)
-
-        new_members: list[Any] = [None] * len(new_builders)
-        if self._members and self._members[0] is not None:
-            try:
-                new_members[0] = self._members[0].with_structured_output(schema, **kwargs)
-            except Exception:
-                new_members[0] = new_builders[0]()
-        elif new_builders:
-            new_members[0] = new_builders[0]()
-        return _FallbackLLM(new_members, new_names, new_builders)
 
     def with_config(self, config: dict | None = None, **kwargs) -> _FallbackLLM:
         """Apply Runnable config (e.g. callbacks=[]) lazily to fallback members."""
@@ -517,6 +532,27 @@ def _build_chain(provider_list: list) -> _FallbackLLM | None:
     builders: list[Callable[[], Any]] = []
 
     for provider_name, model, build_fn, provider_prefix in provider_list:
+        if provider_name == "cloudflare":
+            settings = get_settings()
+            account_id = (
+                settings.cloudflare_ai_account_id
+                or settings.cloudflare_account_id
+                or os.getenv("CLOUDFLARE_AI_ACCOUNT_ID")
+                or os.getenv("CLOUDFLARE_ACCOUNT_ID")
+            )
+            token = (
+                settings.cloudflare_ai_api_token
+                or settings.cloudflare_api_token
+                or os.getenv("CLOUDFLARE_AI_API_TOKEN")
+                or os.getenv("CLOUDFLARE_API_TOKEN")
+            )
+            if not account_id or not token:
+                continue
+            b_fn = partial(_build_cloudflare, model, api_key=token)
+            builders.append(b_fn)
+            names.append(f"cloudflare/{model}")
+            continue
+
         if provider_name == "ollama":
             settings = get_settings()
             base_url = settings.ollama_base_url or os.getenv("OLLAMA_BASE_URL")

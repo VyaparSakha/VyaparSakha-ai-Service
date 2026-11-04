@@ -246,9 +246,10 @@ _DOMAIN_PATTERNS: dict[str, re.Pattern] = {
 
 _CONVERSATIONAL_PATTERNS = re.compile(
     r"\b(hi|hello|hey|hii|helo|hola|good morning|good evening|good afternoon|good night|goodnight|howdy|"
-    r"how are you|kaise ho|kya haal|who are you|tum kaun ho|aap kaun ho|"
+    r"how are you|how r u|kaise ho|kaesa ho|kaisa ho|kese ho|kease ho|kaise hain|kaisa hai|kaise ho aap|aap kaise ho|"
+    r"kya haal|kya hal|haal chaal|sab theek|sab badhiya|who are you|tum kaun ho|aap kaun ho|"
     r"what can you do|kya kar sakte ho|thanks|thank you|thankyou|thx|ok|okay|"
-    r"bye|goodbye|cya|take care|gn|namaste|pranam)\b",
+    r"bye|goodbye|cya|take care|gn|namaste|namaskar|pranam|ram ram|radhe radhe)\b",
     re.IGNORECASE,
 )
 
