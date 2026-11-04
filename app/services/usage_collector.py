@@ -307,12 +307,27 @@ class UsageCollector:
                 primary_model = usage.model
 
         # Estimated credit calculation for immediate client display (Express settlement is authoritative)
-        token_cost = total_in * 2 + total_out * 6
+        prov_l = primary_provider.lower()
+        mod_l = primary_model.lower()
+        if "gemini" in prov_l or "gemini" in mod_l or "flash" in mod_l:
+            in_rate = 0.05
+            out_rate = 0.15
+            audio_in_rate = 0.05
+            audio_out_rate = 0.10
+            max_cap = 50
+        else:
+            in_rate = 2.0
+            out_rate = 6.0
+            audio_in_rate = 1.0
+            audio_out_rate = 2.0
+            max_cap = 250
+
+        token_cost = total_in * in_rate + total_out * out_rate
         token_credits = math.ceil(token_cost / 1000) if token_cost > 0 else 0
-        audio_credits = math.ceil(total_audio_in * 1 + total_audio_out * 2)
+        audio_credits = math.ceil(total_audio_in * audio_in_rate + total_audio_out * audio_out_rate)
         estimated_credits = token_credits + audio_credits
         if estimated_credits > 0 or total_tok > 0 or total_audio_in > 0:
-            estimated_credits = max(1, min(estimated_credits, 250))
+            estimated_credits = max(1, min(estimated_credits, max_cap))
 
         return {
             "executionId": self.execution_id,
