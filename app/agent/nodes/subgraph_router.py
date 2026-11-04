@@ -169,13 +169,15 @@ async def subgraph_router(state: dict) -> dict:
         result_state = await compiled_graph.ainvoke(subgraph_input)
 
         if subgraph_name == "document_generation":
+            file_meta = result_state.get("file_metadata", {})
             subgraph_output = {
                 "success": result_state.get("status") == "success",
-                "file": result_state.get("file_metadata", {}),
+                "file": file_meta,
                 "document_type": result_state.get("document_type", "excel"),
                 "attempts": result_state.get("retry_count", 0) + 1,
                 "validation": result_state.get("validation_result", {}),
                 "error": result_state.get("error"),
+                "preview": result_state.get("preview_data") or file_meta.get("preview", {}),
             }
         else:
             subgraph_output = result_state.get(output_key, {})

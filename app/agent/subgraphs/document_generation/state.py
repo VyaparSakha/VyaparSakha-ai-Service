@@ -24,6 +24,8 @@ class DocumentGenerationState(TypedDict, total=False):
 
     # Specification & Generation outputs
     document_spec: dict[str, Any]
+    generated_code: str
+    preview_data: dict[str, Any]
     generated_file_path: str
     generated_filename: str
     mime_type: str

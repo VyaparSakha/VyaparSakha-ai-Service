@@ -291,6 +291,25 @@ def build_visual_from_tool(tool_name: str, result: Any) -> Optional[dict]:
                 "pageSize": 5,
             }
 
+    # 8. Document Generation -> Interactive Document Preview Spec
+    if tool_name in ("invoke_document_generation", "tool_document_generation"):
+        file_meta = data.get("file") if isinstance(data.get("file"), dict) else {}
+        preview_data = data.get("preview") or file_meta.get("preview") or {}
+        doc_type = data.get("document_type") or file_meta.get("document_type") or "excel"
+        filename = file_meta.get("filename") or f"report.{'xlsx' if doc_type == 'excel' else 'docx'}"
+        download_url = file_meta.get("download_url")
+
+        return {
+            "type": "document_preview",
+            "documentType": doc_type,
+            "filename": filename,
+            "fileId": file_meta.get("file_id", ""),
+            "fileSize": file_meta.get("size", 0),
+            "downloadUrl": download_url,
+            "storageKey": file_meta.get("storage_key", ""),
+            "preview": preview_data if isinstance(preview_data, dict) else {},
+        }
+
     return None
 
 
