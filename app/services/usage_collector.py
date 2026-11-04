@@ -644,7 +644,13 @@ async def check_balance_with_express(
                     "balance": data.get("balance", 0),
                     "reason": data.get("reason"),
                 }
+            LOGGER.warning(
+                "express_balance_check_failed_status",
+                status_code=resp.status_code,
+                endpoint=endpoint,
+                body=resp.text[:300],
+            )
             return {"allowed": False, "reason": "CHECK_FAILED", "error": resp.text}
     except Exception as exc:
-        LOGGER.error("express_balance_check_failed", error=str(exc))
+        LOGGER.error("express_balance_check_failed", endpoint=endpoint, error=str(exc))
         return {"allowed": False, "reason": "NETWORK_ERROR", "error": str(exc)}

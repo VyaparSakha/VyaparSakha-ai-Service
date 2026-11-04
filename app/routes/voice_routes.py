@@ -792,28 +792,6 @@ async def voice_assistant_websocket(
         feature="voice",
     )
 
-    # Pre-flight credit balance check (no rigid 50-credit upfront reservation)
-    balance_res = await check_balance_with_express(
-        store_id=store_id,
-        user_id=user_id,
-    )
-    if not balance_res.get("allowed"):
-        LOGGER.warning(
-            "voice_session_insufficient_credits",
-            execution_id=execution_id,
-            reason=balance_res.get("reason"),
-        )
-        try:
-            await websocket.send_json({
-                "type": "error",
-                "code": balance_res.get("reason") or "INSUFFICIENT_CREDITS",
-                "message": "You have 0 AI credits remaining. Please recharge your wallet in Settings.",
-            })
-        except Exception:
-            pass
-        await websocket.close(code=1008)
-        return
-
     # 1. Authoritatively resolve user role, ownership, and permissions
     db = get_database()
     (
@@ -840,6 +818,38 @@ async def voice_assistant_websocket(
         permissions=resolved_perms,
         user_name=resolved_user_name,
     )
+
+    # 2. Pre-flight credit balance check (no rigid 50-credit upfront reservation)
+    balance_res = await check_balance_with_express(
+        store_id=store_id,
+        user_id=user_id,
+    )
+    if not balance_res.get("allowed"):
+        reason = balance_res.get("reason") or "INSUFFICIENT_CREDITS"
+        LOGGER.warning(
+            "voice_session_insufficient_credits",
+            execution_id=execution_id,
+            reason=reason,
+            error=balance_res.get("error"),
+        )
+        msg = "You have 0 AI credits remaining. Please recharge your wallet in Settings."
+        if reason == "MONTHLY_LIMIT_EXCEEDED":
+            msg = "Monthly AI credit limit reached. Please recharge or upgrade in Settings."
+        elif reason == "WALLET_INACTIVE":
+            msg = "AI credit wallet is inactive. Please contact support."
+        elif reason in ("CHECK_FAILED", "NETWORK_ERROR"):
+            msg = "Unable to verify AI credit wallet balance. Please try again."
+
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "code": reason,
+                "message": msg,
+            })
+        except Exception:
+            pass
+        await websocket.close(code=1008)
+        return
 
     # 2. Pre-load Memory and Store Profile Context in Parallel with RBAC boundaries
     LOGGER.info("voice_loading_context", user_id=user_id, store_id=store_id)
