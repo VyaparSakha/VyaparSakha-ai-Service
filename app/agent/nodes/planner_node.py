@@ -15,7 +15,7 @@ from typing import Dict, Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.agent.state import VyaparAgentState
-from app.lib.llm import get_reasoning_llm, get_small_llm
+from app.lib.llm import get_planner_llm, get_reasoning_llm, get_small_llm
 
 LOGGER = structlog.get_logger("vyaparsathi.ai.agent.planner")
 
@@ -62,7 +62,7 @@ async def planner_node(state: VyaparAgentState) -> Dict[str, Any]:
 
     LOGGER.info("planner_node_start", store_id=store_id, prompt_len=len(prompt))
 
-    llm = get_reasoning_llm() or get_small_llm()
+    llm = get_planner_llm() or get_reasoning_llm() or get_small_llm()
     if not llm:
         LOGGER.error("planner_node_no_llm")
         return {

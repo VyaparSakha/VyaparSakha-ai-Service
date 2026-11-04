@@ -96,13 +96,24 @@ _OPENAI_BASE_URL = {
     "openrouter": "https://openrouter.ai/api/v1",
 }
 
-# 1. Reasoning & Strategic Thinking (think_node, planner_node)
+# 1. Reasoning & Strategic Thinking (think_node, synthesis)
 _REASONING_PROVIDERS = [
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("nvidia", "meta/llama-3.2-90b-vision-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
-    ("nvidia", "meta/llama-3.2-11b-vision-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
+    ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
+    ("ollama", "llama3", _build_ollama, "OLLAMA"),
+]
+
+# 1b. Planner Tier (planner_node) - Prioritizes large 120B reasoning models for generating plans
+_PLANNER_PROVIDERS = [
+    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
+    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
+    ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
@@ -116,53 +127,58 @@ _INTENT_PROVIDERS = [
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("nvidia", "meta/llama-3.2-11b-vision-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
 
 # 3. Critic & Reflection Evaluation (critic_node, reflection_node)
-# Non-Gemini primary (Groq 120B / 20B / Qwen / NVIDIA) to conserve Gemini rate limits
+# Non-Gemini primary (Groq 120B / 20B / Qwen) to conserve Gemini rate limits
 _CRITIC_PROVIDERS = [
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("nvidia", "meta/llama-3.2-11b-vision-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
-    ("nvidia", "mistralai/mistral-large-2-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),  # Emergency tail fallback
 ]
 
 # 4. Fast Auxiliary & Memory (memory extraction, retrieval rerank, conflict resolution, summarizer)
-# Non-Gemini primary: Groq 20B (ultra fast), Groq Qwen 27B, NVIDIA 11B
+# Non-Gemini primary: Groq 20B (ultra fast), Groq Qwen 27B
 _SMALL_PROVIDERS = [
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("nvidia", "meta/llama-3.2-11b-vision-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
     ("openrouter", "google/gemma-2-9b-it:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),  # Emergency tail fallback
 ]
 
 # 5. Guardrail / Safeguard (grader_node)
-# Non-Gemini primary: Groq Safeguard 20B, Groq 20B, NVIDIA Guard
+# Non-Gemini primary: Groq Safeguard 20B, Groq 20B
 _SAFEGUARD_PROVIDERS = [
     ("groq", "openai/gpt-oss-safeguard-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("nvidia", "meta/llama-guard-4-12b", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
-    ("nvidia", "meta/llama-3.2-11b-vision-instruct", partial(_build_openai, base_url=_OPENAI_BASE_URL["nvidia"]), "NVIDIA"),
     ("openrouter", "google/gemma-2-9b-it:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),  # Emergency tail fallback
 ]
 
 
 # ---------------------------------------------------------------------------
-# Fallback Chain with Automatic Cooldown
+# Fallback Chain with Automatic Cooldown & Daily Quota Protection
 # ---------------------------------------------------------------------------
 
 _PROVIDER_COOLDOWNS: dict[str, float] = {}
 _COOLDOWN_SECONDS = 45.0
+_DAILY_COOLDOWN_SECONDS = 43200.0  # 12 hours for free-tier daily quota exhaustion
+
+_DAILY_QUOTA_KEYWORDS = (
+    "per day limit exceeded",
+    "daily limit",
+    "requests per day",
+    "generate_content_free_tier_requests",
+    "quota exceeded for metric",
+    "limit: 20",
+    "please retry in",
+)
 
 _RATE_LIMIT_KEYWORDS = (
     "429",
@@ -175,9 +191,80 @@ _RATE_LIMIT_KEYWORDS = (
     "too many requests",
     "overloaded",
     "413",
+    "request too large",
     "503",
     "service unavailable",
 )
+
+
+def _is_on_cooldown(name: str, now: float) -> bool:
+    """Check if a provider or its base model is on cooldown."""
+    if _PROVIDER_COOLDOWNS.get(name, 0) > now:
+        return True
+    base_name = name.split("[")[0]
+    if base_name != name and _PROVIDER_COOLDOWNS.get(base_name, 0) > now:
+        return True
+    return False
+
+
+def _record_provider_error(name: str, exc: Exception) -> None:
+    """Record rate limits and quota exhaustions with proper tiered cooldowns."""
+    err_msg = str(exc).lower()
+    now = time.time()
+    base_name = name.split("[")[0]
+    if any(k in err_msg for k in _DAILY_QUOTA_KEYWORDS):
+        _PROVIDER_COOLDOWNS[name] = now + _DAILY_COOLDOWN_SECONDS
+        _PROVIDER_COOLDOWNS[base_name] = now + _DAILY_COOLDOWN_SECONDS
+        LOGGER.warning(
+            "llm_provider_daily_exhaustion_detected",
+            provider=name,
+            cooldown_s=_DAILY_COOLDOWN_SECONDS,
+            error=str(exc)[:150],
+        )
+    elif any(k in err_msg for k in _RATE_LIMIT_KEYWORDS):
+        # If it's a 413 or tool schema limit, cool down only the tool-bound member, not base text model!
+        _PROVIDER_COOLDOWNS[name] = now + _COOLDOWN_SECONDS
+        if "413" not in err_msg and "request too large" not in err_msg:
+            _PROVIDER_COOLDOWNS[base_name] = now + _COOLDOWN_SECONDS
+        LOGGER.warning(
+            "llm_provider_cooldown_set",
+            provider=name,
+            cooldown_s=_COOLDOWN_SECONDS,
+            error=str(exc)[:150],
+        )
+
+
+def _get_valid_indices(names: list[str]) -> list[int]:
+    """
+    Get active indices not on cooldown. If all are on cooldown,
+    reset ONLY short-term cooldowns to avoid hammering daily-exhausted keys.
+    """
+    now = time.time()
+    valid = [idx for idx, name in enumerate(names) if not _is_on_cooldown(name, now)]
+    if valid:
+        return valid
+
+    LOGGER.warning("llm_all_providers_on_cooldown_checking_resets", providers=names)
+    # Reset only short-term cooldowns (< 10 minutes left). NEVER reset daily-exhausted keys!
+    for name in names:
+        cooldown_until = _PROVIDER_COOLDOWNS.get(name, 0)
+        if 0 < cooldown_until - now <= 600.0:
+            _PROVIDER_COOLDOWNS.pop(name, None)
+        base = name.split("[")[0]
+        base_cooldown = _PROVIDER_COOLDOWNS.get(base, 0)
+        if 0 < base_cooldown - now <= 600.0:
+            _PROVIDER_COOLDOWNS.pop(base, None)
+
+    valid = [idx for idx, name in enumerate(names) if not _is_on_cooldown(name, now)]
+    if valid:
+        return valid
+
+    # Absolute fallback: if everything is strictly exhausted, reset everything
+    LOGGER.error("llm_all_providers_strictly_exhausted_emergency_reset", providers=names)
+    for name in names:
+        _PROVIDER_COOLDOWNS.pop(name, None)
+        _PROVIDER_COOLDOWNS.pop(name.split("[")[0], None)
+    return list(range(len(names)))
 
 
 class _FallbackLLM:
@@ -210,13 +297,7 @@ class _FallbackLLM:
     # -- LangChain Runnable interface ---------------------------------------
 
     def invoke(self, input, config=None, **kwargs):
-        now = time.time()
-        valid_indices = [idx for idx, name in enumerate(self._names) if _PROVIDER_COOLDOWNS.get(name, 0) <= now]
-        if not valid_indices:
-            LOGGER.warning("llm_all_providers_on_cooldown_resetting", providers=self._names)
-            for name in self._names:
-                _PROVIDER_COOLDOWNS.pop(name, None)
-            valid_indices = list(range(len(self._names)))
+        valid_indices = _get_valid_indices(self._names)
 
         last_error = None
         for idx in valid_indices:
@@ -227,10 +308,7 @@ class _FallbackLLM:
                 return member.invoke(input, config=config, **kwargs)
             except Exception as exc:
                 last_error = exc
-                err_msg = str(exc).lower()
-                if any(k in err_msg for k in _RATE_LIMIT_KEYWORDS):
-                    _PROVIDER_COOLDOWNS[name] = time.time() + _COOLDOWN_SECONDS
-                    LOGGER.warning("llm_provider_cooldown_set", provider=name, cooldown_s=_COOLDOWN_SECONDS)
+                _record_provider_error(name, exc)
                 LOGGER.warning(
                     "llm_fallback_member_failed",
                     provider=name,
@@ -242,13 +320,7 @@ class _FallbackLLM:
         raise RuntimeError(f"All LLM providers ({self._names}) failed to invoke.")
 
     async def ainvoke(self, input, config=None, **kwargs):
-        now = time.time()
-        valid_indices = [idx for idx, name in enumerate(self._names) if _PROVIDER_COOLDOWNS.get(name, 0) <= now]
-        if not valid_indices:
-            LOGGER.warning("llm_all_providers_on_cooldown_resetting", providers=self._names)
-            for name in self._names:
-                _PROVIDER_COOLDOWNS.pop(name, None)
-            valid_indices = list(range(len(self._names)))
+        valid_indices = _get_valid_indices(self._names)
 
         last_error = None
         for idx in valid_indices:
@@ -259,11 +331,8 @@ class _FallbackLLM:
                 return await member.ainvoke(input, config=config, **kwargs)
             except Exception as exc:
                 last_error = exc
-                err_msg = str(exc).lower()
-                if any(k in err_msg for k in _RATE_LIMIT_KEYWORDS):
-                    _PROVIDER_COOLDOWNS[name] = time.time() + _COOLDOWN_SECONDS
-                    LOGGER.warning("llm_provider_cooldown_set", provider=name, cooldown_s=_COOLDOWN_SECONDS)
-                if "event loop" in err_msg or "closed" in err_msg:
+                _record_provider_error(name, exc)
+                if "event loop" in str(exc).lower() or "closed" in str(exc).lower():
                     try:
                         fresh_member = self._builders[idx]()
                         self._members[idx] = fresh_member
@@ -281,13 +350,7 @@ class _FallbackLLM:
         raise RuntimeError(f"All LLM providers ({self._names}) failed to invoke.")
 
     def stream(self, input, config=None, **kwargs):
-        now = time.time()
-        valid_indices = [idx for idx, name in enumerate(self._names) if _PROVIDER_COOLDOWNS.get(name, 0) <= now]
-        if not valid_indices:
-            LOGGER.warning("llm_all_providers_on_cooldown_resetting", providers=self._names)
-            for name in self._names:
-                _PROVIDER_COOLDOWNS.pop(name, None)
-            valid_indices = list(range(len(self._names)))
+        valid_indices = _get_valid_indices(self._names)
 
         last_error = None
         for idx in valid_indices:
@@ -300,10 +363,7 @@ class _FallbackLLM:
                 return
             except Exception as exc:
                 last_error = exc
-                err_msg = str(exc).lower()
-                if any(k in err_msg for k in _RATE_LIMIT_KEYWORDS):
-                    _PROVIDER_COOLDOWNS[name] = time.time() + _COOLDOWN_SECONDS
-                    LOGGER.warning("llm_provider_cooldown_set", provider=name, cooldown_s=_COOLDOWN_SECONDS)
+                _record_provider_error(name, exc)
                 LOGGER.warning(
                     "llm_fallback_member_failed",
                     provider=name,
@@ -315,13 +375,7 @@ class _FallbackLLM:
         raise RuntimeError(f"All LLM providers ({self._names}) failed to stream.")
 
     async def astream(self, input, config=None, **kwargs):
-        now = time.time()
-        valid_indices = [idx for idx, name in enumerate(self._names) if _PROVIDER_COOLDOWNS.get(name, 0) <= now]
-        if not valid_indices:
-            LOGGER.warning("llm_all_providers_on_cooldown_resetting", providers=self._names)
-            for name in self._names:
-                _PROVIDER_COOLDOWNS.pop(name, None)
-            valid_indices = list(range(len(self._names)))
+        valid_indices = _get_valid_indices(self._names)
 
         last_error = None
         for idx in valid_indices:
@@ -334,11 +388,8 @@ class _FallbackLLM:
                 return
             except Exception as exc:
                 last_error = exc
-                err_msg = str(exc).lower()
-                if any(k in err_msg for k in _RATE_LIMIT_KEYWORDS):
-                    _PROVIDER_COOLDOWNS[name] = time.time() + _COOLDOWN_SECONDS
-                    LOGGER.warning("llm_provider_cooldown_set", provider=name, cooldown_s=_COOLDOWN_SECONDS)
-                if "event loop" in err_msg or "closed" in err_msg:
+                _record_provider_error(name, exc)
+                if "event loop" in str(exc).lower() or "closed" in str(exc).lower():
                     try:
                         fresh_member = self._builders[idx]()
                         self._members[idx] = fresh_member
@@ -359,7 +410,7 @@ class _FallbackLLM:
 
     def bind_tools(self, tools, **kwargs):
         """Bind tools lazily to fallback members."""
-        new_names = list(self._names)
+        new_names = [f"{n}[tools]" for n in self._names]
         new_builders = []
         for b in self._builders:
             def _make_tool_bound_builder(builder=b):
@@ -385,8 +436,29 @@ class _FallbackLLM:
 
     def with_structured_output(self, schema: Any, **kwargs) -> _FallbackLLM:
         """Bind structured output schema lazily to fallback members."""
-        new_names = list(self._names)
+        new_names = [f"{n}[struct]" for n in self._names]
         new_builders = []
+        for b in self._builders:
+            def _make_structured_builder(builder=b):
+                instance = builder()
+                if hasattr(instance, "with_structured_output"):
+                    try:
+                        return instance.with_structured_output(schema, **kwargs)
+                    except Exception as e:
+                        LOGGER.warning("with_structured_output_failed_on_member", error=str(e)[:150])
+                        return instance
+                return instance
+            new_builders.append(_make_structured_builder)
+
+        new_members: list[Any] = [None] * len(new_builders)
+        if self._members and self._members[0] is not None:
+            try:
+                new_members[0] = self._members[0].with_structured_output(schema, **kwargs)
+            except Exception:
+                new_members[0] = new_builders[0]()
+        elif new_builders:
+            new_members[0] = new_builders[0]()
+        return _FallbackLLM(new_members, new_names, new_builders)
         for b in self._builders:
             def _make_structured_builder(builder=b):
                 instance = builder()
@@ -509,7 +581,25 @@ def get_reasoning_llm() -> _FallbackLLM | None:
 
 # Backward compatible aliases for the reasoning tier
 get_llm = get_reasoning_llm
-get_planner_llm = get_reasoning_llm
+
+_planner_llm_cache: _FallbackLLM | None = None
+
+
+def get_planner_llm() -> _FallbackLLM | None:
+    """
+    Return the fallback LLM chain for complex planning (`planner_node`).
+    Prioritizes large models like Groq 120B (`openai/gpt-oss-120b`) and Gemini Flash
+    for fast, high-quality structured execution plans without rate limit failures.
+    """
+    global _planner_llm_cache
+    if _planner_llm_cache is not None:
+        return _planner_llm_cache
+    chain = _build_chain(_PLANNER_PROVIDERS)
+    if chain is None:
+        return get_reasoning_llm()
+    LOGGER.info("get_planner_llm_fallback_chain_built", members=chain._names)
+    _planner_llm_cache = chain
+    return _planner_llm_cache
 
 
 def get_intent_llm() -> _FallbackLLM | None:
