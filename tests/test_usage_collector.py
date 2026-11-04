@@ -247,3 +247,116 @@ async def test_llm_result_with_chat_generation_google_genai():
     assert summary["creditsConsumed"] > 0
     assert summary["modelBreakdown"][0]["providerUsageStatus"] == "verified"
 
+
+def test_usage_collector_stage_delta_computation():
+    collector = UsageCollector(
+        execution_id="exec_stage_008",
+        user_id="user_123",
+        store_id="store_abc",
+        feature="copilot",
+    )
+
+    # Initial delta is empty
+    d0 = collector.get_stage_delta()
+    assert d0["has_delta"] is False
+    assert d0["delta_in"] == 0
+    assert d0["delta_out"] == 0
+
+    # Add stage 1 model usage
+    collector.add_model_usage(
+        run_id="run_stage_1",
+        output=AIMessage(content="Stage 1", usage_metadata={"input_tokens": 500, "output_tokens": 150, "total_tokens": 650}),
+    )
+
+    d1 = collector.get_stage_delta()
+    assert d1["has_delta"] is True
+    assert d1["delta_in"] == 500
+    assert d1["delta_out"] == 150
+
+    # Simulate advancing watermark after stage 1 deduction
+    collector._last_deducted_input_tokens = d1["total_in"]
+    collector._last_deducted_output_tokens = d1["total_out"]
+
+    # Now delta is zero until next stage
+    d1_after = collector.get_stage_delta()
+    assert d1_after["has_delta"] is False
+    assert d1_after["delta_in"] == 0
+    assert d1_after["delta_out"] == 0
+
+    # Add stage 2 model usage
+    collector.add_model_usage(
+        run_id="run_stage_2",
+        output=AIMessage(content="Stage 2", usage_metadata={"input_tokens": 300, "output_tokens": 100, "total_tokens": 400}),
+    )
+
+    d2 = collector.get_stage_delta()
+    assert d2["has_delta"] is True
+    assert d2["delta_in"] == 300
+    assert d2["delta_out"] == 100
+    assert d2["total_in"] == 800
+    assert d2["total_out"] == 250
+
+
+@pytest.mark.asyncio
+async def test_deduct_stage_usage_with_express_detects_exhaustion():
+    from unittest.mock import patch, AsyncMock
+    collector = UsageCollector(
+        execution_id="exec_stage_009",
+        user_id="user_123",
+        store_id="store_abc",
+        feature="copilot",
+    )
+
+    collector.add_model_usage(
+        run_id="run_stage_1",
+        output=AIMessage(content="Stage 1", usage_metadata={"input_tokens": 500, "output_tokens": 100, "total_tokens": 600}),
+    )
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "success": True,
+        "data": {
+            "creditsCharged": 1,
+            "remainingBalance": 0,
+            "isExhausted": True,
+        },
+    }
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        res = await collector.deduct_stage_usage_with_express(stage_name="think")
+
+        assert res is not None
+        assert res["success"] is True
+        assert res["isExhausted"] is True
+        assert res["remainingBalance"] == 0
+        assert collector.is_exhausted is True
+        assert collector._last_deducted_input_tokens == 500
+
+
+@pytest.mark.asyncio
+async def test_check_balance_with_express():
+    from unittest.mock import patch, AsyncMock
+    from app.services.usage_collector import check_balance_with_express
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "success": True,
+        "data": {
+            "allowed": True,
+            "balance": 20,
+            "reason": None,
+        },
+    }
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        check = await check_balance_with_express(store_id="store_123", user_id="user_456")
+
+        assert check["allowed"] is True
+        assert check["balance"] == 20
+        assert check["reason"] is None
+
+

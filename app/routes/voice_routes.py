@@ -38,6 +38,7 @@ from app.agent.tools.visual_builders import build_visual_from_tool
 from app.agent.tools.visual_builders import build_visual_for_tool
 from app.services.usage_collector import (
     UsageCollector,
+    check_balance_with_express,
     reserve_credits_with_express,
     report_usage_to_express,
     release_reservation_with_express,
@@ -791,24 +792,22 @@ async def voice_assistant_websocket(
         feature="voice",
     )
 
-    reserve_res = await reserve_credits_with_express(
-        execution_id=execution_id,
+    # Pre-flight credit balance check (no rigid 50-credit upfront reservation)
+    balance_res = await check_balance_with_express(
         store_id=store_id,
-        credits=50,
-        feature_name="voice",
         user_id=user_id,
     )
-    if not reserve_res.get("success"):
+    if not balance_res.get("allowed"):
         LOGGER.warning(
             "voice_session_insufficient_credits",
             execution_id=execution_id,
-            error=reserve_res.get("error"),
+            reason=balance_res.get("reason"),
         )
         try:
             await websocket.send_json({
                 "type": "error",
-                "code": "INSUFFICIENT_CREDITS",
-                "message": "Insufficient AI credits to start voice session. Please top up your wallet in Settings.",
+                "code": balance_res.get("reason") or "INSUFFICIENT_CREDITS",
+                "message": "You have 0 AI credits remaining. Please recharge your wallet in Settings.",
             })
         except Exception:
             pass
@@ -1129,6 +1128,20 @@ async def voice_assistant_websocket(
                             await websocket.send_json({
                                 "type": "turn_complete",
                             })
+
+                            # Incrementally deduct credits for this speech turn
+                            stage_res = await voice_collector.deduct_stage_usage_with_express(stage_name="voice_turn")
+                            if stage_res and stage_res.get("isExhausted"):
+                                LOGGER.warning("voice_session_credits_exhausted", execution_id=execution_id)
+                                try:
+                                    await websocket.send_json({
+                                        "type": "error",
+                                        "code": "CREDIT_LIMIT_REACHED",
+                                        "message": "AI credit balance has reached 0. Ending voice session. Please recharge your wallet in Settings.",
+                                    })
+                                except Exception:
+                                    pass
+                                break
 
                     # Handle tool calls
                     if "toolCall" in data:

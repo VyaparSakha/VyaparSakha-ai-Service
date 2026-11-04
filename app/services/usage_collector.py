@@ -98,6 +98,12 @@ class UsageCollector:
         self._runs: Dict[str, NormalizedModelUsage] = {}
         self.total_audio_in_sec: float = 0.0
         self.total_audio_out_sec: float = 0.0
+        self._last_deducted_input_tokens: int = 0
+        self._last_deducted_output_tokens: int = 0
+        self._last_deducted_audio_in: float = 0.0
+        self._last_deducted_audio_out: float = 0.0
+        self._stage_count: int = 0
+        self.is_exhausted: bool = False
 
     def add_model_usage(
         self,
@@ -347,6 +353,122 @@ class UsageCollector:
             "timestamp": time.time(),
         }
 
+    def get_stage_delta(self) -> dict:
+        """
+        Calculates delta token and audio usage since the last stage deduction.
+        """
+        total_in = 0
+        total_out = 0
+        for usage in self._runs.values():
+            total_in += usage.input_tokens
+            total_out += usage.output_tokens
+
+        delta_in = max(0, total_in - self._last_deducted_input_tokens)
+        delta_out = max(0, total_out - self._last_deducted_output_tokens)
+        delta_audio_in = max(0.0, self.total_audio_in_sec - self._last_deducted_audio_in)
+        delta_audio_out = max(0.0, self.total_audio_out_sec - self._last_deducted_audio_out)
+
+        return {
+            "total_in": total_in,
+            "total_out": total_out,
+            "delta_in": delta_in,
+            "delta_out": delta_out,
+            "delta_audio_in": delta_audio_in,
+            "delta_audio_out": delta_audio_out,
+            "has_delta": (delta_in > 0 or delta_out > 0 or delta_audio_in > 0 or delta_audio_out > 0),
+        }
+
+    async def deduct_stage_usage_with_express(self, stage_name: str = "stage") -> Optional[dict]:
+        """
+        Deducts credit usage for the incremental delta tokens/audio incurred since the last stage.
+        Calls Express `POST /api/ai-billing/internal/report-usage`.
+        If the wallet balance is exhausted (<= 0), sets self.is_exhausted = True and returns
+        isExhausted: True so the caller can immediately halt further orchestration.
+        """
+        delta = self.get_stage_delta()
+        if not delta["has_delta"]:
+            return {"isExhausted": self.is_exhausted, "creditsCharged": 0}
+
+        self._stage_count += 1
+        current_stage = f"{stage_name}_{self._stage_count}"
+
+        # Resolve primary model & provider from latest run
+        primary_provider = "gemini"
+        primary_model = "gemini-2.5-flash"
+        if self._runs:
+            latest_run = list(self._runs.values())[-1]
+            primary_provider = latest_run.provider
+            primary_model = latest_run.model
+
+        payload = {
+            "executionId": self.execution_id,
+            "userId": self.user_id,
+            "storeId": self.store_id,
+            "feature": self.feature,
+            "provider": primary_provider,
+            "model": primary_model,
+            "inputTokens": delta["delta_in"],
+            "outputTokens": delta["delta_out"],
+            "audioInputUnits": round(delta["delta_audio_in"], 2),
+            "audioOutputUnits": round(delta["delta_audio_out"], 2),
+            "executionStatus": "in_progress",
+            "metadata": {
+                "stageName": current_stage,
+                "isStageDeduction": True,
+                "cumulativeInputTokens": delta["total_in"],
+                "cumulativeOutputTokens": delta["total_out"],
+            },
+        }
+
+        settings = get_settings()
+        endpoint = f"{settings.express_backend_url.rstrip('/')}/api/ai-billing/internal/report-usage"
+        headers = {
+            "Content-Type": "application/json",
+            "x-internal-service-key": settings.internal_service_key,
+            "x-service-name": "vyapar-ai-service",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(endpoint, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    # Advance deducted token watermarks
+                    self._last_deducted_input_tokens = delta["total_in"]
+                    self._last_deducted_output_tokens = delta["total_out"]
+                    self._last_deducted_audio_in = self.total_audio_in_sec
+                    self._last_deducted_audio_out = self.total_audio_out_sec
+
+                    is_exhausted = bool(data.get("isExhausted"))
+                    remaining_balance = data.get("remainingBalance", 0)
+                    if is_exhausted or (remaining_balance is not None and remaining_balance <= 0):
+                        self.is_exhausted = True
+
+                    LOGGER.info(
+                        "stage_usage_deducted_success",
+                        execution_id=self.execution_id,
+                        stage=current_stage,
+                        credits_charged=data.get("creditsCharged"),
+                        remaining_balance=remaining_balance,
+                        is_exhausted=self.is_exhausted,
+                    )
+                    return {
+                        "success": True,
+                        "creditsCharged": data.get("creditsCharged", 0),
+                        "remainingBalance": remaining_balance,
+                        "isExhausted": self.is_exhausted,
+                    }
+                else:
+                    LOGGER.warning(
+                        "stage_usage_deduction_non_200",
+                        status_code=resp.status_code,
+                        body=resp.text[:300],
+                    )
+                    return {"success": False, "isExhausted": False, "error": resp.text}
+        except Exception as exc:
+            LOGGER.error("stage_usage_deduction_failed", error=str(exc))
+            return {"success": False, "isExhausted": False, "error": str(exc)}
+
 
 class BillingUsageCallback(AsyncCallbackHandler):
     """
@@ -488,3 +610,41 @@ async def release_reservation_with_express(execution_id: str, reason: str = "") 
     except Exception as exc:
         LOGGER.warning("express_release_request_failed", error=str(exc))
         return {"success": False, "error": str(exc)}
+
+
+async def check_balance_with_express(
+    store_id: str = "",
+    user_id: str = "default_user",
+    owner_id: str = "",
+) -> dict:
+    """
+    Calls Express internal endpoint `POST /api/ai-billing/internal/check-balance`
+    to check if user/owner has credits available before starting.
+    """
+    settings = get_settings()
+    endpoint = f"{settings.express_backend_url.rstrip('/')}/api/ai-billing/internal/check-balance"
+    headers = {
+        "Content-Type": "application/json",
+        "x-internal-service-key": settings.internal_service_key,
+        "x-service-name": "vyapar-ai-service",
+    }
+    payload = {
+        "storeId": store_id,
+        "userId": user_id,
+        "ownerId": owner_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+            if resp.status_code == 200:
+                body = resp.json()
+                data = body.get("data", {})
+                return {
+                    "allowed": bool(data.get("allowed")),
+                    "balance": data.get("balance", 0),
+                    "reason": data.get("reason"),
+                }
+            return {"allowed": False, "reason": "CHECK_FAILED", "error": resp.text}
+    except Exception as exc:
+        LOGGER.error("express_balance_check_failed", error=str(exc))
+        return {"allowed": False, "reason": "NETWORK_ERROR", "error": str(exc)}

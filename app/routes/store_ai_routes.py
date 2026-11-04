@@ -265,6 +265,25 @@ async def _stream_graph_events(
                             output=output,
                             metadata=metadata,
                         )
+                        # Incremental stage deduction & balance exhaustion check
+                        node_name = metadata.get("langgraph_node") or name or "model_turn"
+                        stage_res = await usage_collector.deduct_stage_usage_with_express(stage_name=node_name)
+                        if stage_res and stage_res.get("isExhausted"):
+                            LOGGER.warning(
+                                "stream_credit_exhausted_halting_orchestration",
+                                execution_id=usage_collector.execution_id,
+                                node=node_name,
+                            )
+                            limit_msg = (
+                                "\n\n⚠️ **AI Credit Limit Reached**: Your AI credits have been exhausted. "
+                                "Further processing was stopped to prevent extra charges. "
+                                "Please recharge your wallet in Settings to continue."
+                            )
+                            yield f"event: token\ndata: {json.dumps({'text': limit_msg})}\n\n"
+                            yield f"event: error\ndata: {json.dumps({'code': 'CREDIT_LIMIT_REACHED', 'message': 'AI credit limit reached.'})}\n\n"
+                            result["error"] = "CREDIT_LIMIT_REACHED"
+                            assistant_text_parts.append(limit_msg)
+                            break
                     except Exception as u_err:
                         LOGGER.warning("model_usage_capture_failed", error=str(u_err))
 
@@ -950,7 +969,17 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                     )
 
             if result.get("error"):
-                usage_summary = usage_collector.get_summary(execution_status="error")
+                if result.get("error") == "CREDIT_LIMIT_REACHED":
+                    limit_full_response = result.get("full_response") or ""
+                    if limit_full_response:
+                        await add_assistant_message(
+                            chat_id,
+                            limit_full_response,
+                            metadata={"thread_id": thread_id, "stopped_reason": "CREDIT_LIMIT_REACHED"},
+                        )
+                usage_summary = usage_collector.get_summary(
+                    execution_status="exhausted" if result.get("error") == "CREDIT_LIMIT_REACHED" else "error"
+                )
                 yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
                 asyncio.create_task(report_usage_to_express(usage_summary))
                 yield "event: done\ndata: {}\n\n"
@@ -1276,7 +1305,17 @@ async def clarify(
                     pass
 
             if result.get("error"):
-                usage_summary = usage_collector.get_summary(execution_status="error")
+                if result.get("error") == "CREDIT_LIMIT_REACHED":
+                    limit_full_response = result.get("full_response") or ""
+                    if limit_full_response:
+                        await add_assistant_message(
+                            chat_id,
+                            limit_full_response,
+                            metadata={"thread_id": thread_id, "stopped_reason": "CREDIT_LIMIT_REACHED"},
+                        )
+                usage_summary = usage_collector.get_summary(
+                    execution_status="exhausted" if result.get("error") == "CREDIT_LIMIT_REACHED" else "error"
+                )
                 yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
                 asyncio.create_task(report_usage_to_express(usage_summary))
                 yield "event: done\ndata: {}\n\n"
