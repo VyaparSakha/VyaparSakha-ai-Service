@@ -46,6 +46,10 @@ def get_provider_keys(provider_prefix: str) -> list[str]:
         os.environ.get(f"{prefix}_API_KEYS", ""),
         getattr(settings, f"{prefix.lower()}_api_key", "") or "",
         os.environ.get(f"{prefix}_API_KEY", ""),
+        os.environ.get(f"{prefix}_KEY", ""),
+        os.environ.get(f"{prefix}_API_TOKEN", ""),
+        os.environ.get(f"{prefix}_TOKEN", ""),
+        os.environ.get(f"{prefix}", ""),
     ]
 
     for raw in raw_keys_sources:
@@ -55,9 +59,15 @@ def get_provider_keys(provider_prefix: str) -> list[str]:
                 if cleaned and cleaned not in keys:
                     keys.append(cleaned)
 
-    # Check numbered keys: PREFIX_API_KEY_1, PREFIX_API_KEY1, PREFIX_API_KEY_2, PREFIX_API_KEY2...
+    # Check numbered keys: PREFIX_API_KEY_1, PREFIX_API_KEY1, PREFIX_KEY_1, PREFIX_1...
     for i in range(1, 10):
-        for pattern in (f"{prefix}_API_KEY_{i}", f"{prefix}_API_KEY{i}"):
+        for pattern in (
+            f"{prefix}_API_KEY_{i}",
+            f"{prefix}_API_KEY{i}",
+            f"{prefix}_KEY_{i}",
+            f"{prefix}_KEY{i}",
+            f"{prefix}_{i}",
+        ):
             val = os.environ.get(pattern, "").strip()
             if val and val not in keys:
                 keys.append(val)
