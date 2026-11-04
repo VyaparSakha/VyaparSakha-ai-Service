@@ -25,7 +25,12 @@ from app.config.settings import get_settings
 from app.config.database import get_database
 from app.agent.service.sales.summary import fetch_sales_summary, _resolve_store_id
 from app.agent.memory.redis_cache import get_redis
-from app.agent.tools.registry import VYAPAR_TOOLS
+from app.agent.tools.registry import (
+    VYAPAR_TOOLS,
+    get_allowed_tool_names_for_user,
+    is_tool_allowed_for_user,
+    get_tool_by_name,
+)
 from app.agent.nodes.memory_query import _bootstrap_user_memory, _bootstrap_store_memory
 from app.agent.prompts.voice_prompt import build_voice_system_prompt
 _build_voice_system_prompt = build_voice_system_prompt
@@ -121,9 +126,12 @@ def _clean_gemini_schema(node: Any) -> Any:
     return cleaned
 
 
-def _get_gemini_tools():
+def _get_gemini_tools(is_owner: bool = True, permissions: list[str] | None = None):
+    allowed_names = get_allowed_tool_names_for_user(is_owner=is_owner, permissions=permissions)
     gemini_tools = []
     for tool in VYAPAR_TOOLS:
+        if tool.name not in allowed_names:
+            continue
         args_schema = getattr(tool, "args_schema", None)
         raw_parameters = args_schema.model_json_schema() if args_schema else {
             "type": "object",
@@ -184,7 +192,12 @@ def _pcm_rms(audio_bytes: bytes):
     return math.sqrt(sum(sample * sample for sample in samples) / sample_count)
 
 
-async def _connect_gemini_live(api_key: str, system_prompt: str):
+async def _connect_gemini_live(
+    api_key: str,
+    system_prompt: str,
+    is_owner: bool = True,
+    permissions: list[str] | None = None,
+):
     """Connect to Gemini Live using the supported model set, with fallback retries."""
     last_error = None
     gemini_ws = None
@@ -208,7 +221,7 @@ async def _connect_gemini_live(api_key: str, system_prompt: str):
                     },
                     "inputAudioTranscription": {},
                     "outputAudioTranscription": {},
-                    "tools": _get_gemini_tools()
+                    "tools": _get_gemini_tools(is_owner=is_owner, permissions=permissions)
                 }
             }
             await gemini_ws.send(json.dumps(setup_msg))
@@ -238,13 +251,17 @@ from app.agent.memory.redis_cache import (
 )
 
 
-async def _bootstrap_voice_memory_context(user_id: str, store_id: str):
+async def _bootstrap_voice_memory_context(user_id: str, store_id: str, is_owner: bool = True):
     """
     Multi-Tier Memory Bootstrap:
-    1. Check fast Redis cache first.
-    2. Fall back to Pinecone vector DB if cache misses.
-    3. Cache retrieved memories back into Redis for sub-millisecond future turns.
+    1. If not store owner, do not leak confidential owner goals or diary memories to staff.
+    2. Check fast Redis cache first.
+    3. Fall back to Pinecone vector DB if cache misses.
+    4. Cache retrieved memories back into Redis for sub-millisecond future turns.
     """
+    if not is_owner:
+        return [], []
+
     user_memories = None
     store_memories = None
 
@@ -278,8 +295,166 @@ async def _bootstrap_voice_memory_context(user_id: str, store_id: str):
     return user_memories or [], store_memories or []
 
 
-async def _bootstrap_store_details_context(user_id: str, store_id: str) -> str:
-    """Fetch complete live store profile, contact email, user details, and key business KPIs from MongoDB."""
+async def _resolve_voice_user_role_and_permissions(
+    db,
+    user_id: str,
+    store_id: str,
+    client_role: Optional[str] = None,
+    client_is_owner: Optional[bool] = None,
+    client_permissions: Optional[str] = None,
+) -> tuple[bool, str, list[str], str, str]:
+    """
+    Authoritatively resolve user identity, ownership, role, and permissions.
+    Returns: (is_owner, user_role, permissions_list, user_name, owner_name)
+    """
+    parsed_perms = [p.strip() for p in (client_permissions or "").split(",") if p.strip()] if client_permissions else []
+
+    store_oid = await _resolve_store_id(db, store_id)
+    store_doc = {}
+    if store_oid:
+        try:
+            store_doc = (await db["stores"].find_one({"_id": store_oid})) or {}
+        except Exception as s_err:
+            LOGGER.warning("voice_store_lookup_error", error=str(s_err))
+
+    # Find user document in MongoDB
+    user_doc = None
+    user_query_clauses = []
+    if user_id:
+        if ObjectId.is_valid(user_id):
+            user_query_clauses.append({"_id": ObjectId(user_id)})
+        user_query_clauses.extend([
+            {"firebaseUid": user_id},
+            {"uid": user_id},
+            {"_id": user_id},
+            {"email": user_id},
+        ])
+    if user_query_clauses:
+        try:
+            user_doc = await db["users"].find_one({"$or": user_query_clauses})
+        except Exception as u_err:
+            LOGGER.warning("voice_user_lookup_error", error=str(u_err))
+
+    user_name = (
+        (user_doc.get("name") or user_doc.get("displayName") or user_doc.get("fullName"))
+        if user_doc
+        else None
+    )
+
+    # Find Store Owner info
+    owner_oid = store_doc.get("owner")
+    owner_firebase_uid = store_doc.get("ownerFirebaseUid")
+    owner_name = "Store Owner"
+
+    if owner_oid or owner_firebase_uid:
+        owner_clauses = []
+        if owner_oid:
+            o_id = owner_oid if isinstance(owner_oid, ObjectId) else (ObjectId(str(owner_oid)) if ObjectId.is_valid(str(owner_oid)) else None)
+            if o_id:
+                owner_clauses.append({"_id": o_id})
+        if owner_firebase_uid:
+            owner_clauses.append({"firebaseUid": owner_firebase_uid})
+        if owner_clauses:
+            try:
+                owner_doc = await db["users"].find_one({"$or": owner_clauses})
+                if owner_doc:
+                    owner_name = owner_doc.get("name") or owner_doc.get("displayName") or owner_doc.get("fullName") or owner_name
+            except Exception:
+                pass
+
+    # Check if current user is the owner
+    is_owner_db = False
+    if store_doc and user_doc:
+        user_oid = user_doc.get("_id")
+        if owner_oid and user_oid and str(owner_oid) == str(user_oid):
+            is_owner_db = True
+        elif owner_firebase_uid and user_doc.get("firebaseUid") == owner_firebase_uid:
+            is_owner_db = True
+    elif store_doc and user_id:
+        if str(owner_oid) == str(user_id) or str(owner_firebase_uid) == str(user_id):
+            is_owner_db = True
+
+    # Authoritative store owner determination
+    if is_owner_db:
+        return (
+            True,
+            "Owner",
+            ["*"],
+            user_name or owner_name,
+            owner_name,
+        )
+
+    # Check employee membership in DB
+    employee_doc = None
+    if store_oid and user_doc:
+        try:
+            employee_doc = await db["employees"].find_one({
+                "store": store_oid,
+                "user": user_doc["_id"],
+                "status": "active",
+            })
+        except Exception as e_err:
+            LOGGER.warning("voice_employee_lookup_error", error=str(e_err))
+
+    if employee_doc:
+        role_id = employee_doc.get("role")
+        role_name = "Employee"
+        role_permissions: list[str] = []
+        if role_id:
+            try:
+                role_doc = await db["roles"].find_one({"_id": role_id})
+                if role_doc:
+                    role_name = role_doc.get("name") or role_name
+                    role_permissions = role_doc.get("permissions") or []
+            except Exception as r_err:
+                LOGGER.warning("voice_role_lookup_error", error=str(r_err))
+
+        return (
+            False,
+            role_name,
+            role_permissions,
+            user_name or "Store Employee",
+            owner_name,
+        )
+
+    # Fallback to client flags if provided (e.g. testing or mock environments)
+    if client_is_owner is True:
+        return (
+            True,
+            "Owner",
+            ["*"],
+            user_name or owner_name,
+            owner_name,
+        )
+    elif client_is_owner is False or client_role:
+        return (
+            False,
+            client_role or "Employee",
+            parsed_perms,
+            user_name or "Store Employee",
+            owner_name,
+        )
+
+    # Default fallback: assume owner only if user matches owner ID or no specific employee restriction
+    return (
+        True,
+        "Owner",
+        ["*"],
+        user_name or owner_name,
+        owner_name,
+    )
+
+
+async def _bootstrap_store_details_context(
+    user_id: str,
+    store_id: str,
+    user_role: str = "Owner",
+    is_owner: bool = True,
+    permissions: list[str] | None = None,
+    user_name: str | None = None,
+    owner_name: str | None = None,
+) -> str:
+    """Fetch complete live store profile, contact email, user details, and role-authorized business KPIs from MongoDB."""
     try:
         db = get_database()
         store_oid = await _resolve_store_id(db, store_id)
@@ -295,38 +470,10 @@ async def _bootstrap_store_details_context(user_id: str, store_id: str) -> str:
         store_address = store_doc.get("address") or store_doc.get("city") or "India"
         gst_number = store_doc.get("gstin") or store_doc.get("gstNumber") or "N/A"
 
-        # 2. Fetch User Profile document
-        user_name = "Store Owner"
-        user_email = store_email
-        user_query_clauses = []
-        if user_id:
-            if ObjectId.is_valid(user_id):
-                user_query_clauses.append({"_id": ObjectId(user_id)})
-            user_query_clauses.extend([
-                {"firebaseUid": user_id},
-                {"uid": user_id},
-                {"_id": user_id},
-                {"email": user_id},
-            ])
+        effective_user_name = user_name or ("Store Owner" if is_owner else f"Store {user_role}")
+        effective_owner_name = owner_name or "Store Owner"
 
-        # Also fallback to store's owner fields if available
-        if store_doc:
-            if store_doc.get("owner"):
-                o_ref = store_doc["owner"]
-                user_query_clauses.append({"_id": o_ref if isinstance(o_ref, ObjectId) else ObjectId(str(o_ref))})
-            if store_doc.get("ownerFirebaseUid"):
-                user_query_clauses.append({"firebaseUid": store_doc["ownerFirebaseUid"]})
-
-        if user_query_clauses:
-            try:
-                user_doc = await db["users"].find_one({"$or": user_query_clauses})
-                if user_doc:
-                    user_name = user_doc.get("name") or user_doc.get("displayName") or user_doc.get("fullName") or user_name
-                    user_email = user_doc.get("email") or user_doc.get("userEmail") or store_email
-            except Exception as u_err:
-                LOGGER.warning("voice_user_lookup_error", error=str(u_err))
-
-        # 3. Calculate Key Store Metrics
+        # 2. Calculate Key Store Metrics
         total_products = 0
         low_stock_count = 0
         total_suppliers = 0
@@ -342,20 +489,39 @@ async def _bootstrap_store_details_context(user_id: str, store_id: str) -> str:
             total_suppliers = await db["sellers"].count_documents({"store": store_oid})
             total_customers = await db["buyers"].count_documents({"store": store_oid})
 
-        # 4. Fetch 30-Day Sales KPIs
-        sales_kpi = await fetch_sales_summary(store_id, days_lookback=30)
-        total_rev = sales_kpi.get("total_revenue", 0.0)
-        sales_count = sales_kpi.get("total_sales_count", 0)
+        # 3. Fetch 30-Day Sales KPIs (Only if owner or reports:view_sales permission granted)
+        can_view_sales = is_owner or (permissions and ("reports:view_sales" in permissions or "*" in permissions))
+        sales_kpi_line = ""
+        if can_view_sales:
+            sales_kpi = await fetch_sales_summary(store_id, days_lookback=30)
+            total_rev = sales_kpi.get("total_revenue", 0.0)
+            sales_count = sales_kpi.get("total_sales_count", 0)
+            sales_kpi_line = f"- 30-Day Total Sales Revenue: ₹{total_rev:,.2f} ({sales_count} completed orders)"
+        else:
+            sales_kpi_line = "- 30-Day Total Sales Revenue: [RESTRICTED] (Confidential to Store Owner / Manager with reports:view_sales permission)"
 
-        # 5. Fetch Recent Dispatched Emails / Notes from Redis Diary
+        # 4. Fetch Recent Dispatched Emails / Notes from Redis Diary (Owner only)
         recent_notes = []
-        try:
-            redis_client = await get_redis()
-            diary_key = f"store:{store_id}:notes"
-            recent_notes_raw = await redis_client.lrange(diary_key, 0, 5)
-            recent_notes = [n.decode("utf-8") for n in recent_notes_raw if n]
-        except Exception:
-            pass
+        if is_owner:
+            try:
+                redis_client = await get_redis()
+                diary_key = f"store:{store_id}:notes"
+                recent_notes_raw = await redis_client.lrange(diary_key, 0, 5)
+                recent_notes = [n.decode("utf-8") for n in recent_notes_raw if n]
+            except Exception:
+                pass
+
+        if is_owner:
+            user_identity_lines = [
+                f"- Active Caller: {effective_user_name} (Store Owner & Proprietor)",
+                f"- Store Official Email: {store_email}",
+            ]
+        else:
+            user_identity_lines = [
+                f"- Active Caller: {effective_user_name} (Role: {user_role})",
+                f"- Store Owner / Proprietor: {effective_owner_name}",
+                f"- Store Official Email: {store_email}",
+            ]
 
         context_lines = [
             "==================================================",
@@ -363,22 +529,20 @@ async def _bootstrap_store_details_context(user_id: str, store_id: str) -> str:
             "==================================================",
             f"- Store Name: {store_name}",
             f"- Store ID: {store_id}",
-            f"- Owner / Merchant Name: {user_name}",
-            f"- Store Official Email: {store_email}",
-            f"- User Account Email: {user_email}",
+            *user_identity_lines,
             f"- Contact Phone: {store_phone}",
             f"- Location: {store_address}",
             f"- GSTIN: {gst_number}",
             "",
-            "CURRENT INVENTORY & FINANCIAL OVERVIEW (30 DAYS):",
+            "CURRENT INVENTORY & OPERATIONAL OVERVIEW:",
             f"- Active Catalog Products: {total_products} items",
             f"- Low-Stock Products: {low_stock_count} items requiring restock",
             f"- Connected Suppliers / Distributors: {total_suppliers} vendors",
             f"- Registered Customers / Buyers: {total_customers} clients",
-            f"- 30-Day Total Sales Revenue: ₹{total_rev:,.2f} ({sales_count} completed orders)",
+            sales_kpi_line,
         ]
 
-        if recent_notes:
+        if is_owner and recent_notes:
             context_lines.extend([
                 "",
                 "RECENT MERCHANT DIARY & EMAIL DISPATCH LOGS:",
@@ -604,7 +768,10 @@ def _get_tool_status_label(fn_name: str, args: dict) -> tuple[str, str]:
 async def voice_assistant_websocket(
     websocket: WebSocket,
     user_id: str = Query(..., description="The user's ID"),
-    store_id: str = Query(..., description="The store's ID")
+    store_id: str = Query(..., description="The store's ID"),
+    user_role: Optional[str] = Query(None, description="The user's active role"),
+    is_owner: Optional[bool] = Query(None, description="Whether the user is the store owner"),
+    permissions: Optional[str] = Query(None, description="Comma-separated permissions"),
 ):
     await websocket.accept()
 
@@ -648,11 +815,46 @@ async def voice_assistant_websocket(
         await websocket.close(code=1008)
         return
 
-    # 1. Pre-load Memory and Store Profile Context in Parallel
+    # 1. Authoritatively resolve user role, ownership, and permissions
+    db = get_database()
+    (
+        resolved_is_owner,
+        resolved_role,
+        resolved_perms,
+        resolved_user_name,
+        resolved_owner_name,
+    ) = await _resolve_voice_user_role_and_permissions(
+        db=db,
+        user_id=user_id,
+        store_id=store_id,
+        client_role=user_role,
+        client_is_owner=is_owner,
+        client_permissions=permissions,
+    )
+
+    LOGGER.info(
+        "voice_session_rbac_resolved",
+        user_id=user_id,
+        store_id=store_id,
+        user_role=resolved_role,
+        is_owner=resolved_is_owner,
+        permissions=resolved_perms,
+        user_name=resolved_user_name,
+    )
+
+    # 2. Pre-load Memory and Store Profile Context in Parallel with RBAC boundaries
     LOGGER.info("voice_loading_context", user_id=user_id, store_id=store_id)
     bootstrap_results = await asyncio.gather(
-        _bootstrap_voice_memory_context(user_id, store_id),
-        _bootstrap_store_details_context(user_id, store_id),
+        _bootstrap_voice_memory_context(user_id, store_id, is_owner=resolved_is_owner),
+        _bootstrap_store_details_context(
+            user_id=user_id,
+            store_id=store_id,
+            user_role=resolved_role,
+            is_owner=resolved_is_owner,
+            permissions=resolved_perms,
+            user_name=resolved_user_name,
+            owner_name=resolved_owner_name,
+        ),
         return_exceptions=True
     )
     
@@ -677,12 +879,26 @@ async def voice_assistant_websocket(
             "Proceed with a fresh voice conversation using the current context only."
         )
 
-    system_prompt = build_voice_system_prompt(user_id, store_id, memory_context, store_context)
+    system_prompt = build_voice_system_prompt(
+        user_id=user_id,
+        store_id=store_id,
+        memory_context=memory_context,
+        store_context=store_context,
+        user_role=resolved_role,
+        is_owner=resolved_is_owner,
+        permissions=resolved_perms,
+        user_name=resolved_user_name,
+    )
 
     gemini_ws = None
     try:
-        # 2. Connect via raw websockets using the valid Gemini Live models.
-        gemini_ws = await _connect_gemini_live(api_key, system_prompt)
+        # 3. Connect via raw websockets using the valid Gemini Live models, bound only to permitted tools.
+        gemini_ws = await _connect_gemini_live(
+            api_key=api_key,
+            system_prompt=system_prompt,
+            is_owner=resolved_is_owner,
+            permissions=resolved_perms,
+        )
         LOGGER.info("setup_complete")
         # Signal the frontend that Gemini is ready
         await websocket.send_json({"type": "ready"})
@@ -924,6 +1140,35 @@ async def voice_assistant_websocket(
                             fn_args = fn.get("args", {})
                             fn_id = fn.get("id", fn_name)
                             LOGGER.info("voice_tool_call", tool=fn_name, args=fn_args)
+
+                            # RBAC Gate: Verify this tool execution is permitted for current role & permissions
+                            if not is_tool_allowed_for_user(fn_name, is_owner=resolved_is_owner, permissions=resolved_perms):
+                                LOGGER.warning(
+                                    "voice_tool_rbac_blocked",
+                                    tool=fn_name,
+                                    user_role=resolved_role,
+                                    is_owner=resolved_is_owner,
+                                    permissions=resolved_perms,
+                                )
+                                denied_message = (
+                                    f"Permission Denied: Your assigned role '{resolved_role}' does not have permission "
+                                    f"to execute '{fn_name}'. This action is restricted to authorized roles or the store owner."
+                                )
+                                try:
+                                    await websocket.send_json({
+                                        "type": "tool_complete",
+                                        "tool": fn_name,
+                                        "label": f"Access Denied for {resolved_role}",
+                                        "args": fn_args,
+                                        "result": {"error": denied_message},
+                                    })
+                                except Exception as ws_err:
+                                    LOGGER.warning("voice_ws_tool_denied_send_failed", error=str(ws_err))
+                                return {
+                                    "id": fn_id,
+                                    "name": fn_name,
+                                    "response": {"error": denied_message},
+                                }
 
                             start_label, complete_label = _get_tool_status_label(fn_name, fn_args)
                             # Notify client that tool execution has started
