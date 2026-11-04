@@ -109,13 +109,18 @@ class UsageCollector:
     ) -> Optional[NormalizedModelUsage]:
         """
         Extracts verified token usage from output and adds to ledger.
-        Skips if run_id has already been recorded.
+        Skips if run_id has already been recorded with verified token counts.
         """
-        if not run_id or run_id in self._runs:
+        if not run_id:
+            return None
+
+        # If already recorded with verified usage, prevent double-counting
+        existing = self._runs.get(run_id)
+        if existing and existing.provider_usage_status == "verified" and existing.total_tokens > 0:
             return None
 
         metadata = metadata or {}
-        resolved_provider = provider or metadata.get("ls_provider") or "default"
+        resolved_provider = provider or metadata.get("ls_provider") or metadata.get("provider") or "default"
         resolved_model = model or metadata.get("ls_model_name") or metadata.get("model") or "default"
 
         in_tokens = 0
@@ -125,49 +130,102 @@ class UsageCollector:
         audio_out = 0.0
         status = "missing"
 
-        # 1. Standard LangChain AIMessage usage_metadata
+        # 1. Handle LangChain LLMResult (output.generations -> ChatGeneration -> message)
+        if hasattr(output, "generations") and output.generations:
+            for gen_list in output.generations:
+                for gen in (gen_list or []):
+                    msg = getattr(gen, "message", None)
+                    if msg:
+                        msg_usage = getattr(msg, "usage_metadata", None)
+                        if isinstance(msg_usage, dict) and msg_usage:
+                            in_tokens += msg_usage.get("input_tokens") or 0
+                            out_tokens += msg_usage.get("output_tokens") or 0
+                            tot_tokens += msg_usage.get("total_tokens") or (in_tokens + out_tokens)
+                            if in_tokens > 0 or out_tokens > 0:
+                                status = "verified"
+
+                        msg_resp = getattr(msg, "response_metadata", {}) or {}
+                        if isinstance(msg_resp, dict) and msg_resp:
+                            if msg_resp.get("model_name") and resolved_model == "default":
+                                resolved_model = msg_resp["model_name"]
+                            if msg_resp.get("model_provider") and resolved_provider == "default":
+                                resolved_provider = msg_resp["model_provider"]
+                            if status != "verified":
+                                tok_u = msg_resp.get("token_usage") or msg_resp.get("usage") or {}
+                                if isinstance(tok_u, dict):
+                                    in_tokens += tok_u.get("prompt_tokens") or tok_u.get("input_tokens") or 0
+                                    out_tokens += tok_u.get("completion_tokens") or tok_u.get("output_tokens") or 0
+                                    tot_tokens += tok_u.get("total_tokens") or (in_tokens + out_tokens)
+                                    if in_tokens > 0 or out_tokens > 0:
+                                        status = "verified"
+
+                    gen_info = getattr(gen, "generation_info", {}) or {}
+                    if isinstance(gen_info, dict) and gen_info:
+                        if gen_info.get("model_name") and resolved_model == "default":
+                            resolved_model = gen_info["model_name"]
+
+        # 2. Standard LangChain AIMessage / AIMessageChunk usage_metadata
         usage_meta = getattr(output, "usage_metadata", None)
         if isinstance(usage_meta, dict) and usage_meta:
-            in_tokens = usage_meta.get("input_tokens") or 0
-            out_tokens = usage_meta.get("output_tokens") or 0
-            tot_tokens = usage_meta.get("total_tokens") or (in_tokens + out_tokens)
-            status = "verified"
+            in_tokens = max(in_tokens, usage_meta.get("input_tokens") or 0)
+            out_tokens = max(out_tokens, usage_meta.get("output_tokens") or 0)
+            tot_tokens = max(tot_tokens, usage_meta.get("total_tokens") or (in_tokens + out_tokens))
+            if in_tokens > 0 or out_tokens > 0 or tot_tokens > 0:
+                status = "verified"
 
-        # 2. Provider response_metadata (Google GenAI, OpenAI, Groq, NVIDIA)
+        # 3. Provider response_metadata (Google GenAI, OpenAI, Groq, NVIDIA)
         resp_meta = getattr(output, "response_metadata", {}) or {}
-        if isinstance(resp_meta, dict):
-            # Resolve model name if present in response
-            if resp_meta.get("model_name"):
+        if isinstance(resp_meta, dict) and resp_meta:
+            if resp_meta.get("model_name") and resolved_model == "default":
                 resolved_model = resp_meta["model_name"]
-            elif resp_meta.get("model"):
+            elif resp_meta.get("model") and resolved_model == "default":
                 resolved_model = resp_meta["model"]
+            if resp_meta.get("model_provider") and resolved_provider == "default":
+                resolved_provider = resp_meta["model_provider"]
 
-            # Token usage from response metadata (fallback if usage_metadata was empty)
             if status != "verified":
                 tok_usage = resp_meta.get("token_usage") or resp_meta.get("usage") or {}
                 if isinstance(tok_usage, dict):
-                    in_tokens = tok_usage.get("prompt_tokens") or tok_usage.get("input_tokens") or 0
-                    out_tokens = tok_usage.get("completion_tokens") or tok_usage.get("output_tokens") or 0
-                    tot_tokens = tok_usage.get("total_tokens") or (in_tokens + out_tokens)
+                    in_tokens = max(in_tokens, tok_usage.get("prompt_tokens") or tok_usage.get("input_tokens") or 0)
+                    out_tokens = max(out_tokens, tok_usage.get("completion_tokens") or tok_usage.get("output_tokens") or 0)
+                    tot_tokens = max(tot_tokens, tok_usage.get("total_tokens") or (in_tokens + out_tokens))
                     if in_tokens > 0 or out_tokens > 0:
                         status = "verified"
 
-            # Check for audio usage in metadata
-            audio_in = float(resp_meta.get("input_audio_seconds") or 0.0)
-            audio_out = float(resp_meta.get("output_audio_seconds") or 0.0)
+            audio_in = max(audio_in, float(resp_meta.get("input_audio_seconds") or 0.0))
+            audio_out = max(audio_out, float(resp_meta.get("output_audio_seconds") or 0.0))
 
-        # 3. Handle LLMResult structure if passed from on_llm_end
+        # 4. Handle LLMResult structure if passed with llm_output
         if hasattr(output, "llm_output") and isinstance(output.llm_output, dict):
             llm_out = output.llm_output
+            if llm_out.get("model_name") and resolved_model == "default":
+                resolved_model = llm_out["model_name"]
             token_usage = llm_out.get("token_usage") or {}
-            if isinstance(token_usage, dict):
-                in_tokens = token_usage.get("prompt_tokens") or in_tokens
-                out_tokens = token_usage.get("completion_tokens") or out_tokens
-                tot_tokens = token_usage.get("total_tokens") or (in_tokens + out_tokens)
+            if isinstance(token_usage, dict) and status != "verified":
+                in_tokens = max(in_tokens, token_usage.get("prompt_tokens") or in_tokens)
+                out_tokens = max(out_tokens, token_usage.get("completion_tokens") or out_tokens)
+                tot_tokens = max(tot_tokens, token_usage.get("total_tokens") or (in_tokens + out_tokens))
                 if in_tokens > 0 or out_tokens > 0:
                     status = "verified"
-            if llm_out.get("model_name"):
-                resolved_model = llm_out["model_name"]
+
+        # Provider and Model Normalization
+        prov_lower = resolved_provider.lower()
+        mod_lower = resolved_model.lower()
+        if resolved_provider == "default":
+            if "gemini" in mod_lower or "google" in mod_lower:
+                resolved_provider = "gemini"
+            elif "llama" in mod_lower or "groq" in mod_lower or "mixtral" in mod_lower:
+                resolved_provider = "groq"
+            elif "nvidia" in mod_lower:
+                resolved_provider = "nvidia"
+            else:
+                resolved_provider = "gemini"
+        elif "google_genai" in prov_lower:
+            resolved_provider = "gemini"
+
+        if resolved_model == "default":
+            if "google" in prov_lower or "gemini" in prov_lower:
+                resolved_model = "gemini-2.5-flash"
 
         usage = NormalizedModelUsage(
             execution_id=self.execution_id,
@@ -241,6 +299,8 @@ class UsageCollector:
             breakdown_map[key]["audioInputUnits"] += usage.audio_input_units
             breakdown_map[key]["audioOutputUnits"] += usage.audio_output_units
             breakdown_map[key]["callCount"] += 1
+            if usage.provider_usage_status == "verified":
+                breakdown_map[key]["providerUsageStatus"] = "verified"
 
             if usage.input_tokens > 0 or usage.output_tokens > 0:
                 primary_provider = usage.provider

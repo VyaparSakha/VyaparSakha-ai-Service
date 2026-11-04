@@ -213,3 +213,37 @@ async def test_billing_usage_callback_intercepts_llm_end():
     assert summary["outputTokens"] == 75
     assert summary["totalTokens"] == 225
 
+
+@pytest.mark.asyncio
+async def test_llm_result_with_chat_generation_google_genai():
+    from langchain_core.outputs.chat_generation import ChatGeneration
+    collector = UsageCollector(
+        execution_id="exec_gemini_007",
+        user_id="user_123",
+        store_id="store_abc",
+        feature="copilot",
+    )
+    callback = BillingUsageCallback(collector)
+
+    msg = AIMessage(
+        content="Here is your report",
+        response_metadata={"model_name": "gemini-2.5-flash", "model_provider": "google_genai"},
+        usage_metadata={"input_tokens": 1250, "output_tokens": 320, "total_tokens": 1570},
+    )
+    gen = ChatGeneration(text="Here is your report", message=msg)
+    llm_result = LLMResult(generations=[[gen]], llm_output={})
+
+    await callback.on_llm_end(
+        response=llm_result,
+        run_id="run_gemini_node",
+    )
+
+    summary = collector.get_summary()
+    assert summary["inputTokens"] == 1250
+    assert summary["outputTokens"] == 320
+    assert summary["totalTokens"] == 1570
+    assert summary["model"] == "gemini-2.5-flash"
+    assert summary["provider"] == "gemini"
+    assert summary["creditsConsumed"] > 0
+    assert summary["modelBreakdown"][0]["providerUsageStatus"] == "verified"
+
