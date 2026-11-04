@@ -28,6 +28,7 @@ ALLOWED_ROOT_MODULES = {
     "openpyxl",
     "docx",
     "pandas",
+    "matplotlib",
     "math",
     "datetime",
     "json",
@@ -173,11 +174,44 @@ async def execute_document_code(
         os.makedirs(target_dir, exist_ok=True)
 
     # 2. Prepare script wrapper
-    # Injects OUTPUT_PATH variable at the top
+    # Injects OUTPUT_PATH variable and compatibility shims for python-docx and openpyxl
     escaped_output_path = output_path.replace("\\", "\\\\")
     script_header = (
         f"# -*- coding: utf-8 -*-\n"
         f"OUTPUT_PATH = r\"{escaped_output_path}\"\n\n"
+        f"# Compatibility shims for python-docx\n"
+        f"try:\n"
+        f"    from docx.shared import RGBColor\n"
+        f"    if not hasattr(RGBColor, 'rgb'):\n"
+        f"        RGBColor.rgb = property(lambda self: (self[0] << 16) | (self[1] << 8) | self[2])\n"
+        f"except Exception:\n"
+        f"    pass\n\n"
+        f"try:\n"
+        f"    from docx.oxml import OxmlElement\n"
+        f"    from docx.oxml.ns import qn\n"
+        f"    from docx.oxml.table import CT_TcPr\n"
+        f"    if not hasattr(CT_TcPr, 'get_or_add_tcBorders'):\n"
+        f"        def _shim_tcBorders(self):\n"
+        f"            b = self.find(qn('w:tcBorders'))\n"
+        f"            if b is None:\n"
+        f"                b = OxmlElement('w:tcBorders')\n"
+        f"                self.append(b)\n"
+        f"            return b\n"
+        f"        CT_TcPr.get_or_add_tcBorders = _shim_tcBorders\n"
+        f"except Exception:\n"
+        f"    pass\n\n"
+        f"def set_cell_background(cell, color):\n"
+        f"    try:\n"
+        f"        from docx.oxml import parse_xml\n"
+        f"        from docx.oxml.ns import nsdecls\n"
+        f"        if hasattr(color, '__iter__') and not isinstance(color, str):\n"
+        f"            hex_str = f'{{color[0]:02X}}{{color[1]:02X}}{{color[2]:02X}}'\n"
+        f"        else:\n"
+        f"            hex_str = str(color).lstrip('#')\n"
+        f"        shd = parse_xml(f'<w:shd {{nsdecls(\"w\")}} w:fill=\"{{hex_str}}\"/>')\n"
+        f"        cell._tc.get_or_add_tcPr().append(shd)\n"
+        f"    except Exception:\n"
+        f"        pass\n\n"
     )
     full_script = script_header + code
 

@@ -498,6 +498,50 @@ async def _stream_graph_events(
                 
             elif kind == "on_chain_end" and name in {"morning_briefing", "deep_inventory", "smart_restock", "web_research", "document_generation"}:
                 yield f"event: subgraph_end\ndata: {json.dumps({'name': name})}\n\n"
+                if name == "document_generation":
+                    try:
+                        chain_out = data.get("output", {})
+                        from app.agent.tools.visual_builders import build_visual_from_tool
+                        visual_spec = build_visual_from_tool("invoke_document_generation", chain_out)
+                        if visual_spec and not any(v.get("type") == "document_preview" and v.get("filename") == visual_spec.get("filename") for v in visuals_collected):
+                            visuals_collected.append(visual_spec)
+                            yield f"event: visual\ndata: {json.dumps(visual_spec, default=_json_default)}\n\n"
+                            tool_payload = json.dumps(
+                                {
+                                    "id": f"tool-invoke_document_generation-{len(tools_used_set)}",
+                                    "name": "invoke_document_generation",
+                                    "result": chain_out,
+                                    "status": "completed",
+                                },
+                                default=_json_default,
+                            )
+                            yield f"event: tool_call\ndata: {tool_payload}\n\n"
+                    except Exception as viz_err:
+                        LOGGER.warning("doc_gen_visual_spec_failed", error=str(viz_err))
+
+            elif kind == "on_chain_end" and name == "subgraph_router":
+                try:
+                    router_output = data.get("output", {})
+                    sub_res = router_output.get("subgraph_result", {})
+                    if sub_res.get("subgraph_name") == "document_generation":
+                        doc_output = sub_res.get("output", {})
+                        from app.agent.tools.visual_builders import build_visual_from_tool
+                        visual_spec = build_visual_from_tool("invoke_document_generation", doc_output)
+                        if visual_spec and not any(v.get("type") == "document_preview" and v.get("filename") == visual_spec.get("filename") for v in visuals_collected):
+                            visuals_collected.append(visual_spec)
+                            yield f"event: visual\ndata: {json.dumps(visual_spec, default=_json_default)}\n\n"
+                            tool_payload = json.dumps(
+                                {
+                                    "id": f"tool-invoke_document_generation-{len(tools_used_set)}",
+                                    "name": "invoke_document_generation",
+                                    "result": doc_output,
+                                    "status": "completed",
+                                },
+                                default=_json_default,
+                            )
+                            yield f"event: tool_call\ndata: {tool_payload}\n\n"
+                except Exception as r_err:
+                    LOGGER.warning("subgraph_router_stream_visual_failed", error=str(r_err))
 
 
         # Flush any buffered retry tokens if not already flushed

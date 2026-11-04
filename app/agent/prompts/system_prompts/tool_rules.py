@@ -1,4 +1,4 @@
-﻿"""
+"""
 app/agent/prompts/system_prompts/tool_rules.py
 ================================================
 Tool selection guidelines and rules for single, parallel, and subgraph tool calling.
@@ -60,4 +60,10 @@ TOOL_SELECTION_RULES = f"""
    - `tool_toggle_automation`: Use to pause or resume an automation rule (`status='ACTIVE'` or `'PAUSED'`).
    - `tool_trigger_automation`: Use to run an existing automation immediately out-of-schedule ("Run low stock alert right now").
    - `tool_delete_automation`: Use to remove an automation rule and its schedule permanently.
+
+9. DOCUMENT GENERATION POST-PROCESSING & DOWNLOAD LINKS:
+   - When `invoke_document_generation` executes, it returns `file` with `filename` and `download_url`.
+   - In your final response text, ALWAYS summarize what was generated, highlight the key findings, and ALWAYS include a prominent clickable markdown download link:
+     `📥 [Download Report ({{filename}})]({{download_url}})`
+   - NEVER omit the download URL or claim you cannot provide a link when `download_url` is returned by the tool.
 """

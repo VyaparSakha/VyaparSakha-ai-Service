@@ -147,3 +147,36 @@ doc.save(OUTPUT_PATH)
     assert len(preview["sections"]) >= 1
     assert preview["total_tables"] >= 1
 
+
+@pytest.mark.asyncio
+async def test_execute_document_code_word_with_llm_shims(tmp_path):
+    """Verify that docx compatibility shims (color.rgb, get_or_add_tcBorders, set_cell_background) prevent crashes."""
+    output_file = str(tmp_path / "test_shims_report.docx")
+    code = """
+import docx
+from docx.shared import RGBColor
+
+doc = docx.Document()
+tbl = doc.add_table(rows=1, cols=2)
+cell = tbl.cell(0, 0)
+
+# 1. Test set_cell_background helper with RGBColor
+c = RGBColor(0x1E, 0x29, 0x3B)
+set_cell_background(cell, c)
+
+# 2. Test color.rgb attribute access (which previously failed with AttributeError)
+formatted_hex = f"{c.rgb:06X}"
+assert formatted_hex == "1E293B"
+
+# 3. Test tcPr.get_or_add_tcBorders() (which previously failed with AttributeError)
+tcPr = cell._tc.get_or_add_tcPr()
+borders = tcPr.get_or_add_tcBorders()
+assert borders is not None
+
+doc.save(OUTPUT_PATH)
+"""
+    res = await execute_document_code(code, output_file, timeout=20.0, max_memory_mb=50)
+    assert res["success"] is True, f"Execution failed with: {res.get('error')}"
+    assert os.path.exists(output_file)
+
+
