@@ -14,6 +14,7 @@ from app.agent.state import VyaparAgentState
 from app.agent.utils import latest_human_prompt
 from app.lib.grader import _SEVERE_HARM_KEYWORDS
 from app.lib.llm import get_intent_llm, get_small_llm
+from app.agent.tools.clusters import detect_domains
 from langchain_core.messages import AIMessage
 
 LOGGER = structlog.get_logger("vyaparsathi.ai.agent.intent")
@@ -181,10 +182,12 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             reason=existing_reason,
         )
         needs_memory = existing_intent in _MEMORY_REQUIRED_INTENTS
+        domains = state.get("domains") or detect_domains(prompt)
         return {
             "user_prompt": prompt,
             "intent": existing_intent,
             "intent_reason": existing_reason,
+            "domains": domains,
             "memory_query_needed": needs_memory,
             "user_memory_loaded": not needs_memory,
             "store_memory_loaded": not needs_memory,
@@ -302,10 +305,12 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "response_metadata": {"intent": intent, "fast_path": True, "grader_verdict": intent},
         }
 
+    domains = [] if intent in {"greeting", "harmful", "off_topic"} else detect_domains(prompt)
     return {
         "user_prompt": prompt,
         "intent": intent,
         "intent_reason": reason,
+        "domains": domains,
         "memory_query_needed": needs_memory,
         "user_memory_loaded": not needs_memory,
         "store_memory_loaded": not needs_memory,

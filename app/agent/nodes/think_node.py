@@ -13,8 +13,16 @@ import structlog
 
 from app.agent.state import VyaparAgentState, ToolCall
 from app.lib.llm import get_llm, get_small_llm
+from app.lib.cloudflare_ai import (
+    is_cloudflare_configured,
+    getChatModel,
+    estimate_message_tokens,
+    compress_context_if_needed,
+    MAX_CONTEXT_TOKENS,
+)
 from app.lib.summarizer import summarize
 from app.agent.tools.registry import VYAPAR_TOOLS, get_tools_for_user
+from app.agent.tools.clusters import get_pruned_tools_for_user, detect_domains
 from app.agent.prompts.system_prompts import (
     build_agent_base,
     MEMORY_WARNING,
@@ -81,11 +89,20 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
             )
             return {"memory_query_needed": True}
 
-    llm = get_llm()
+    user_prompt = state.get("user_prompt", "")
+    raw_msgs = state.get("messages", [])
+    if isinstance(user_prompt, str) and not user_prompt.strip() and not raw_msgs:
+        raise ValueError("User message cannot be empty.")
+
+    if is_cloudflare_configured():
+        llm = getChatModel()
+    else:
+        llm = get_llm()
+
     if not llm:
         LOGGER.error("think_node_no_llm", store_id=store_id)
         return {
-            "error": "LLM not configured — set at least one of GEMINI_API_KEY, NVIDIA_API_KEY, or GROQ_API_KEY in .env",
+            "error": "LLM not configured — set at least one of CLOUDFLARE_API_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, or GROQ_API_KEY in .env",
             "goal_status": "failed",
         }
 
@@ -94,21 +111,38 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
     # Force the LLM to output a direct response (no tools) if we hit the loop ceiling
     is_final_loop = loop >= state.get("max_loops", 3)
     
-    # Filter tools based on user ownership and RBAC permissions
+    # Filter tools dynamically based on active domain(s) and RBAC permissions
     is_owner = state.get("is_owner", True)
     permissions = state.get("permissions", [])
     user_role = state.get("user_role", "Owner" if is_owner else "Employee")
-    allowed_tools = get_tools_for_user(is_owner=is_owner, permissions=permissions)
+    domains = state.get("domains")
+    intent = state.get("intent")
 
-    if is_final_loop:
-        LOGGER.info("think_node_max_loops_reached", loop=loop, store_id=store_id)
-        llm_with_tools = llm # No tools bound, forces a text response
+    if intent in ("greeting", "off_topic", "harmful"):
+        allowed_tools = []
+    else:
+        allowed_tools = get_pruned_tools_for_user(
+            domains=domains,
+            prompt=user_prompt,
+            is_owner=is_owner,
+            permissions=permissions,
+        )
+
+    if is_final_loop or not allowed_tools:
+        LOGGER.info(
+            "think_node_direct_text_mode",
+            loop=loop,
+            store_id=store_id,
+            is_final=is_final_loop,
+            tool_count=len(allowed_tools),
+        )
+        llm_with_tools = llm  # No tools bound, forces a text response
     else:
         llm_with_tools = llm.bind_tools(allowed_tools)
 
     # Build system prompt — richer on later loops to guide synthesis
     tools_called = state.get("tools_called_this_loop", [])
-    available = [t for t in state.get("available_tools", []) if t not in tools_called]
+    available = [t.name for t in allowed_tools if t.name not in tools_called]
     results_so_far = state.get("tool_results", [])
     max_loops = state.get("max_loops", 3)
 
@@ -294,6 +328,17 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
         user_prompt = state.get("user_prompt", "") or current_goal or "Please assist me."
         messages.append(HumanMessage(content=user_prompt))
 
+    # Calculate / estimate token size for 10k–20k token context management
+    estimated_tokens = estimate_message_tokens(messages)
+    LOGGER.info(
+        "think_node_token_estimate",
+        loop=loop,
+        estimated_tokens=estimated_tokens,
+        message_count=len(messages),
+    )
+    if estimated_tokens > MAX_CONTEXT_TOKENS:
+        messages = await compress_context_if_needed(messages, max_tokens=MAX_CONTEXT_TOKENS)
+
     LOGGER.debug(
         "think_node_invoking_llm",
         loop=loop,
@@ -409,7 +454,11 @@ async def think_node(state: VyaparAgentState) -> Dict[str, Any]:
             llm_latency_ms=elapsed_ms,
         )
         final_text = _flatten_text(response.content) if hasattr(response, "content") else _flatten_text(response)
-        tools_used = list({r["tool_name"] for r in state.get("tool_results", [])})
+        tools_used = list({
+            r.get("tool_name") or r.get("tool")
+            for r in state.get("tool_results", [])
+            if isinstance(r, dict) and (r.get("tool_name") or r.get("tool"))
+        })
 
         # Determine if this conversation is worth persisting to mem0.
         # Skip trivial exchanges ("hi", "hello", "ok", etc.) to avoid

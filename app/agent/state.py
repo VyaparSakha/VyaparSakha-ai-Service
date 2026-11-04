@@ -451,6 +451,9 @@ class VyaparAgentState(TypedDict):
     intent_reason: str
     """Short internal reason for the selected request intent."""
 
+    domains: list[str]
+    """Active business domains identified for this request (e.g. ['sales'], ['inventory']). Used for dynamic tool pruning."""
+
     requires_planning: bool
     """Flag indicating whether this request is complex and requires a plan."""
 
@@ -764,6 +767,7 @@ def make_initial_state(
         memory_query_needed=False,
         intent="general",
         intent_reason="",
+        domains=[],
         requires_planning=False,
         plan={},
         user_preferences={},

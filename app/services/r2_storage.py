@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -89,8 +90,13 @@ class R2StorageService:
         self._client = client or self._create_client()
 
     def _require_configuration(self) -> str:
+        r2_account_id = (
+            self._settings.effective_cloudflare_r2_account_id
+            or os.environ.get("CLOUDFLARE_R2_ACCOUNT_ID")
+            or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        )
         required = {
-            "CLOUDFLARE_ACCOUNT_ID": self._settings.cloudflare_account_id,
+            "CLOUDFLARE_R2_ACCOUNT_ID": r2_account_id,
             "CLOUDFLARE_R2_ENDPOINT": self._settings.cloudflare_r2_endpoint,
             "CLOUDFLARE_R2_ACCESS_KEY_ID": self._settings.cloudflare_r2_access_key_id,
             "CLOUDFLARE_R2_SECRET_ACCESS_KEY": self._settings.cloudflare_r2_secret_access_key,

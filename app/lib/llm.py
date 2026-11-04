@@ -744,3 +744,15 @@ def get_llm_status() -> dict:
     status["providers"] = all_available
     status["active_count"] = sum(1 for p in all_available if p["configured"])
     return status
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare Workers AI Factory Re-exports
+# ---------------------------------------------------------------------------
+from app.lib.cloudflare_ai import (
+    getChatModel,
+    get_chat_model,
+    is_cloudflare_configured,
+    validate_cloudflare_config,
+    estimate_message_tokens,
+)

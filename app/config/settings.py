@@ -34,12 +34,36 @@ class Settings(BaseSettings):
     firecrawl_api_key: str | None = None
     firecrawl_api_url: str = "https://api.firecrawl.dev"
     firecrawl_timeout_seconds: float = 60.0
+    # Cloudflare Workers AI
+    cloudflare_ai_account_id: str | None = None
+    cloudflare_ai_api_token: str | None = None
+    cloudflare_ai_model: str = "glm"
+    ai_enable_fallback: bool = True
+    ai_max_tokens: int = 2000
+    ai_temperature: float = 0.4
+
     # Cloudflare R2 object storage
-    cloudflare_account_id: str | None = None
+    cloudflare_r2_account_id: str | None = None
     cloudflare_r2_endpoint: str | None = None
     cloudflare_r2_access_key_id: str | None = None
     cloudflare_r2_secret_access_key: str | None = None
     cloudflare_r2_bucket_name: str | None = None
+
+    # Shared / Legacy fallback aliases
+    cloudflare_account_id: str | None = None
+    cloudflare_api_token: str | None = None
+
+    @property
+    def effective_cloudflare_ai_account_id(self) -> str | None:
+        return self.cloudflare_ai_account_id or self.cloudflare_account_id
+
+    @property
+    def effective_cloudflare_ai_api_token(self) -> str | None:
+        return self.cloudflare_ai_api_token or self.cloudflare_api_token
+
+    @property
+    def effective_cloudflare_r2_account_id(self) -> str | None:
+        return self.cloudflare_r2_account_id or self.cloudflare_account_id
 
     # Express Backend URL for communications
     express_backend_url: str = "http://localhost:5000"

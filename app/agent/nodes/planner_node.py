@@ -16,6 +16,7 @@ from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.agent.state import VyaparAgentState
 from app.lib.llm import get_planner_llm, get_reasoning_llm, get_small_llm
+from app.lib.cloudflare_ai import is_cloudflare_configured, getChatModel
 
 LOGGER = structlog.get_logger("vyaparsathi.ai.agent.planner")
 
@@ -56,13 +57,21 @@ Output your response strictly as JSON with no extra markdown formatting:
 
 
 async def planner_node(state: VyaparAgentState) -> Dict[str, Any]:
-    prompt = state.get("user_prompt", "").strip()
+    prompt = state.get("user_prompt", "")
+    if isinstance(prompt, str) and not prompt.strip():
+        LOGGER.warning("planner_node_empty_prompt")
+        raise ValueError("User message cannot be empty.")
+    prompt = str(prompt).strip()
     store_id = state.get("store_id", "unknown")
     t0 = time.perf_counter()
 
     LOGGER.info("planner_node_start", store_id=store_id, prompt_len=len(prompt))
 
-    llm = get_planner_llm() or get_reasoning_llm() or get_small_llm()
+    if is_cloudflare_configured():
+        llm = getChatModel()
+    else:
+        llm = get_planner_llm() or get_reasoning_llm() or get_small_llm()
+
     if not llm:
         LOGGER.error("planner_node_no_llm")
         return {
