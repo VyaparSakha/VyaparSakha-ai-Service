@@ -197,7 +197,7 @@ def build_graph(checkpointer=None):
     # Register nodes
     # --------------------------------------------------------------
 
-    workflow.add_node("context", context_node)
+    # workflow.add_node("context", context_node)
     # workflow.add_node("grader", grader_node)
     workflow.add_node("intent", intent_node)
     workflow.add_node("planner", planner_node)
@@ -211,15 +211,13 @@ def build_graph(checkpointer=None):
     workflow.add_node("reflection", reflection_node)
 
     # --------------------------------------------------------------
-    # Entry point — context loader runs first, then guardrail
-    # context_node fetches user/store snapshot (one DB round-trip)
-    # before any other node so personalization is available globally.
+    # Entry point — intent router runs first
+    # (context_node temporarily commented out)
     # --------------------------------------------------------------
 
-    workflow.set_entry_point("context")
+    workflow.set_entry_point("intent")
 
-    # context → grader (always; context_node never blocks the graph)
-    workflow.add_edge("context", "intent")
+    # workflow.add_edge("context", "intent")
 
     # --------------------------------------------------------------
     # Conditional edges from grader
