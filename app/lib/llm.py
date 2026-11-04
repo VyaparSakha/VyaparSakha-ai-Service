@@ -529,6 +529,12 @@ def _build_chain(provider_list: list) -> _FallbackLLM | None:
 
         keys = get_provider_keys(provider_prefix)
         if not keys:
+            if provider_prefix == "GROQ" and not getattr(_build_chain, "_groq_warned", False):
+                _build_chain._groq_warned = True
+                LOGGER.warning(
+                    "groq_api_key_missing_in_environment",
+                    hint="Set GROQ_API_KEY in Render environment variables to enable GPT-120B and Qwen-27B fallback models!",
+                )
             continue
 
         for idx, key in enumerate(keys, 1):

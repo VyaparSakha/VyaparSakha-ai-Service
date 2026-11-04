@@ -148,12 +148,14 @@ async def lifespan(application: FastAPI):
     # -----------------------------------------------------------------------
     try:
         from app.lib.llm import (
+            get_planner_llm,
             get_reasoning_llm,
             get_intent_llm,
             get_critic_llm,
             get_small_llm,
             get_safeguard_llm,
         )
+        get_planner_llm()
         get_reasoning_llm()
         get_intent_llm()
         get_critic_llm()
