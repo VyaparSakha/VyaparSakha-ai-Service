@@ -9,6 +9,8 @@ Google Gemini Multimodal API via raw websockets.
 
 import json
 import os
+import time
+import uuid
 import structlog
 import asyncio
 import base64
@@ -29,6 +31,12 @@ from app.agent.prompts.voice_prompt import build_voice_system_prompt
 _build_voice_system_prompt = build_voice_system_prompt
 from app.agent.tools.visual_builders import build_visual_from_tool
 from app.agent.tools.visual_builders import build_visual_for_tool
+from app.services.usage_collector import (
+    UsageCollector,
+    reserve_credits_with_express,
+    report_usage_to_express,
+    release_reservation_with_express,
+)
 
 router = APIRouter()
 LOGGER = structlog.get_logger("vyaparsathi.ai.voice")
@@ -607,6 +615,39 @@ async def voice_assistant_websocket(
         await websocket.close(code=1008)
         return
 
+    # Reserve credits on Express for this voice session
+    execution_id = f"voice_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    voice_collector = UsageCollector(
+        execution_id=execution_id,
+        user_id=user_id,
+        store_id=store_id,
+        feature="voice",
+    )
+
+    reserve_res = await reserve_credits_with_express(
+        execution_id=execution_id,
+        store_id=store_id,
+        credits=50,
+        feature_name="voice",
+        user_id=user_id,
+    )
+    if not reserve_res.get("success"):
+        LOGGER.warning(
+            "voice_session_insufficient_credits",
+            execution_id=execution_id,
+            error=reserve_res.get("error"),
+        )
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "code": "INSUFFICIENT_CREDITS",
+                "message": "Insufficient AI credits to start voice session. Please top up your wallet in Settings.",
+            })
+        except Exception:
+            pass
+        await websocket.close(code=1008)
+        return
+
     # 1. Pre-load Memory and Store Profile Context in Parallel
     LOGGER.info("voice_loading_context", user_id=user_id, store_id=store_id)
     bootstrap_results = await asyncio.gather(
@@ -666,20 +707,26 @@ async def voice_assistant_websocket(
 
                     if message.get("bytes") is not None:
                         user_audio_received = True
+                        raw_bytes = message["bytes"]
+                        # Meter audio input: 16 kHz 16-bit mono = 32000 bytes/sec
+                        voice_collector.add_voice_usage(
+                            audio_in_seconds=len(raw_bytes) / 32000.0,
+                            audio_out_seconds=0.0,
+                        )
                         if not activity_started:
                             await gemini_ws.send(json.dumps(_build_gemini_activity_start_message()))
                             activity_started = True
                             LOGGER.info("voice_activity_start_forwarded_to_gemini")
                         # Forward raw 16 kHz PCM using Gemini Live's current audio shape.
-                        chunk = _build_gemini_audio_message(message["bytes"])
+                        chunk = _build_gemini_audio_message(raw_bytes)
                         await gemini_ws.send(json.dumps(chunk))
                         audio_chunk_count += 1
                         if audio_chunk_count == 1 or audio_chunk_count % 25 == 0:
                             LOGGER.info(
                                 "voice_audio_forwarded_to_gemini",
                                 chunks=audio_chunk_count,
-                                bytes=len(message["bytes"]),
-                                pcm_rms=round(_pcm_rms(message["bytes"]), 2),
+                                bytes=len(raw_bytes),
+                                pcm_rms=round(_pcm_rms(raw_bytes), 2),
                             )
                         continue
 
@@ -830,6 +877,11 @@ async def voice_assistant_websocket(
                                     pcm_base64 = part["inlineData"].get("data", "")
                                     if pcm_base64:
                                         pcm_bytes = base64.b64decode(pcm_base64)
+                                        # Meter audio output: 24 kHz 16-bit mono = 48000 bytes/sec
+                                        voice_collector.add_voice_usage(
+                                            audio_in_seconds=0.0,
+                                            audio_out_seconds=len(pcm_bytes) / 48000.0,
+                                        )
                                         await websocket.send_bytes(pcm_bytes)
 
                         if "inputTranscription" in server_content:
@@ -1034,6 +1086,25 @@ async def voice_assistant_websocket(
             await websocket.close()
         except Exception:
             pass
+
+        # Settle actual voice audio usage or release reservation if no audio was consumed
+        try:
+            summary = voice_collector.get_summary(execution_status="completed")
+            if summary.get("audioInputUnits", 0) > 0 or summary.get("audioOutputUnits", 0) > 0:
+                LOGGER.info(
+                    "voice_session_reporting_usage",
+                    execution_id=execution_id,
+                    audio_in=summary.get("audioInputUnits"),
+                    audio_out=summary.get("audioOutputUnits"),
+                )
+                asyncio.create_task(report_usage_to_express(summary))
+            else:
+                LOGGER.info("voice_session_releasing_unused_reservation", execution_id=execution_id)
+                asyncio.create_task(
+                    release_reservation_with_express(execution_id, reason="Zero audio streamed")
+                )
+        except Exception as v_err:
+            LOGGER.warning("voice_billing_settlement_failed", error=str(v_err))
 
         # Flush any uncommitted speech turns
         if user_audio_received and not current_user_speech:

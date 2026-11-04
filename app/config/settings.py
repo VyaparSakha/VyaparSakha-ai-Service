@@ -43,6 +43,7 @@ class Settings(BaseSettings):
 
     # Express Backend URL for communications
     express_backend_url: str = "http://localhost:5000"
+    internal_service_key: str = "vyapar-internal-ai-service-key"
 
     # Document generation limits
     max_generated_file_size_mb: int = 10

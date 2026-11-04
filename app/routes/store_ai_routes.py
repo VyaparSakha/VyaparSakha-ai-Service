@@ -14,15 +14,21 @@ Endpoints:
 """
 
 import json
+import time
 import asyncio
 import uuid
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Any
+from typing import Any, Optional
 
 from langgraph.errors import GraphInterrupt
+from app.services.usage_collector import (
+    UsageCollector,
+    BillingUsageCallback,
+    report_usage_to_express,
+)
 
 from app.services.aggregation_service import (
     get_forecast_for_store,
@@ -199,6 +205,7 @@ async def _stream_graph_events(
     *,
     tools_used_set: set,
     result: dict,
+    usage_collector: Optional[UsageCollector] = None,
 ):
     """
     Async generator that processes LangGraph ``astream_events`` and yields
@@ -245,6 +252,21 @@ async def _stream_graph_events(
                 kind=kind,
                 name=name,
             )
+
+            # --- Model usage tracking (deduplicated by run_id) ---
+            if kind == "on_chat_model_end":
+                if usage_collector is not None:
+                    try:
+                        run_id = event.get("run_id")
+                        output = data.get("output")
+                        metadata = event.get("metadata", {}) or {}
+                        usage_collector.add_model_usage(
+                            run_id=str(run_id) if run_id else None,
+                            output=output,
+                            metadata=metadata,
+                        )
+                    except Exception as u_err:
+                        LOGGER.warning("model_usage_capture_failed", error=str(u_err))
 
             # --- Interrupt detection ---
             # When langgraph.types.interrupt() fires, the runtime emits
@@ -706,6 +728,7 @@ class CopilotStreamPayload(BaseModel):
     # Legacy field kept for backwards compatibility; ignored if chat_id is provided.
     session_id: str | None = None
     language: str | None = "en"
+    execution_id: str | None = None
 
 
 @router.post("/{store_id}/copilot/stream")
@@ -732,6 +755,18 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
     user_role = request.headers.get("x-user-role", "Owner" if is_owner else "Employee")
     permissions_raw = request.headers.get("x-user-permissions", "")
     permissions = [p.strip() for p in permissions_raw.split(",") if p.strip()]
+
+    execution_id = (
+        payload.execution_id
+        or request.headers.get("x-execution-id")
+        or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    )
+    usage_collector = UsageCollector(
+        execution_id=execution_id,
+        user_id=user_id,
+        store_id=store_id,
+        feature="copilot",
+    )
 
     # Resolve the chat session (existing or new)
     chat_session = await get_or_create_chat_session(
@@ -766,6 +801,12 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                 chat_title = await ensure_chat_title(chat_id, payload.message)
                 session_data = json.dumps({"chatId": chat_id, "threadId": thread_id, "title": chat_title, "needsClarification": False}, default=_json_default)
                 yield f"event: session\ndata: {session_data}\n\n"
+
+                # Navigation fast path emits 0-credit usage summary
+                usage_summary = usage_collector.get_summary(execution_status="completed")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
+
                 yield "event: done\ndata: {}\n\n"
                 return
             # -- End navigation fast-path --------------------------------------
@@ -798,7 +839,12 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                     "language": payload.language,
                 }
 
-            config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+            billing_cb = BillingUsageCallback(usage_collector)
+            config = {
+                "configurable": {"thread_id": thread_id},
+                "recursion_limit": 100,
+                "callbacks": [billing_cb],
+            }
 
             result: dict = {}
 
@@ -811,6 +857,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                 config,
                 tools_used_set=tools_used_set,
                 result=result,
+                usage_collector=usage_collector,
             ):
                 yield sse
 
@@ -862,6 +909,12 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                     "needsClarification": True,
                 }, default=_json_default)
                 yield f"event: session\ndata: {session_data}\n\n"
+
+                # Interrupted for clarification: emit intermediate usage
+                usage_summary = usage_collector.get_summary(execution_status="interrupted")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
+
                 yield "event: done\ndata: {}\n\n"
                 return
 
@@ -897,6 +950,9 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                     )
 
             if result.get("error"):
+                usage_summary = usage_collector.get_summary(execution_status="error")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
                 yield "event: done\ndata: {}\n\n"
                 return
 
@@ -921,6 +977,11 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
                 "needsClarification": False,
             }, default=_json_default)
             yield f"event: session\ndata: {session_data}\n\n"
+
+            # Emit final verified usage summary before done
+            usage_summary = usage_collector.get_summary(execution_status="completed")
+            yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+            asyncio.create_task(report_usage_to_express(usage_summary))
 
             yield "event: done\ndata: {}\n\n"
 
@@ -953,6 +1014,12 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
         except (Exception, asyncio.CancelledError) as e:
             error_data = json.dumps({"message": str(e)}, default=_json_default)
             yield f"event: error\ndata: {error_data}\n\n"
+            try:
+                usage_summary = usage_collector.get_summary(execution_status="error")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
+            except Exception:
+                pass
             yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(
@@ -974,6 +1041,7 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
 class ClarifyRequest(BaseModel):
     chat_id: str
     answer: str
+    execution_id: str | None = None
 
 
 @router.post("/{store_id}/clarify")
@@ -1003,12 +1071,25 @@ async def clarify(
 
     user_id = request.headers.get("x-user-id", "default_user")
 
+    execution_id = (
+        payload.execution_id
+        or request.headers.get("x-execution-id")
+        or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    )
+    usage_collector = UsageCollector(
+        execution_id=execution_id,
+        user_id=user_id,
+        store_id=store_id,
+        feature="copilot",
+    )
+
     LOGGER.info(
         "clarify_request_received",
         store_id=store_id,
         chat_id=payload.chat_id,
         answer_preview=payload.answer[:100] if payload.answer else "",
         user_id=user_id,
+        execution_id=execution_id,
     )
 
     # Resolve the chat session (existing — the graph must already be
@@ -1035,7 +1116,12 @@ async def clarify(
     LOGGER.info("clarify_message_persisted", chat_id=chat_id)
 
     graph = build_graph(checkpointer=get_checkpointer())
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+    billing_cb = BillingUsageCallback(usage_collector)
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": 100,
+        "callbacks": [billing_cb],
+    }
 
     tools_used_set: set[str] = set()
 
@@ -1114,6 +1200,7 @@ async def clarify(
                 config,
                 tools_used_set=tools_used_set,
                 result=result,
+                usage_collector=usage_collector,
             ):
                 yield sse
 
@@ -1159,6 +1246,12 @@ async def clarify(
                     default=_json_default,
                 )
                 yield f"event: session\ndata: {session_data}\n\n"
+
+                # Recursive clarification: emit intermediate usage
+                usage_summary = usage_collector.get_summary(execution_status="interrupted")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
+
                 yield "event: done\ndata: {}\n\n"
                 return
 
@@ -1183,6 +1276,9 @@ async def clarify(
                     pass
 
             if result.get("error"):
+                usage_summary = usage_collector.get_summary(execution_status="error")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
                 yield "event: done\ndata: {}\n\n"
                 return
 
@@ -1204,6 +1300,12 @@ async def clarify(
                 default=_json_default,
             )
             yield f"event: session\ndata: {session_data}\n\n"
+
+            # Emit usage before done
+            usage_summary = usage_collector.get_summary(execution_status="completed")
+            yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+            asyncio.create_task(report_usage_to_express(usage_summary))
+
             yield "event: done\ndata: {}\n\n"
 
             # Background memory persistence
@@ -1236,6 +1338,12 @@ async def clarify(
             )
             error_data = json.dumps({"message": str(e)}, default=_json_default)
             yield f"event: error\ndata: {error_data}\n\n"
+            try:
+                usage_summary = usage_collector.get_summary(execution_status="error")
+                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
+                asyncio.create_task(report_usage_to_express(usage_summary))
+            except Exception:
+                pass
             yield "event: done\ndata: {}\n\n"
 
     LOGGER.info("clarify_sse_response_returned", chat_id=chat_id)
