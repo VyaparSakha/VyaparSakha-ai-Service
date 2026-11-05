@@ -18,7 +18,7 @@ import time
 import asyncio
 import uuid
 import structlog
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Any, Optional
@@ -194,11 +194,11 @@ class ApiResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Shared SSE streaming helper — used by both /copilot/stream and /clarify
+# Shared event streaming helpers — raw tuples and SSE formatter
 # ---------------------------------------------------------------------------
 
 
-async def _stream_graph_events(
+async def _stream_graph_events_raw(
     graph,
     graph_input: Any,
     config: dict,
@@ -209,31 +209,18 @@ async def _stream_graph_events(
 ):
     """
     Async generator that processes LangGraph ``astream_events`` and yields
-    SSE-formatted strings.
+    (event_name, data_dict) tuples.
 
-    Shared by the ``/copilot/stream`` (new run) and ``/clarify`` (resume)
-    endpoints so inter­rupt detection and event handling stay consistent.
-
-    Yields SSE event strings (``event: token\\ndata: ...\\n\\n`` etc.).
-
-    After the generator completes, the mutable ``result`` dict is updated
-    with:
-        full_response       — accumulated assistant text (may be empty)
-        interrupt_payloads  — list of langgraph Interrupt objects (empty
-                              if the graph ran to completion)
-        error               — set to the error string if an exception
-                              was raised inside the generator
+    Used by SSE endpoints (/copilot/stream, /clarify) and WebSocket endpoints
+    (/ws/copilot, /ws/chat, /{store_id}/copilot/ws).
     """
     assistant_text_parts: list[str] = []
     interrupt_payloads: list = []
     visuals_collected: list = []
 
     # Track critic-reflection state to suppress intermediate think responses.
-    # When critic FAILS → reflection → think retries, the intermediate think
-    # tokens should NOT be streamed since they were rejected. Only the final
-    # think pass (after critic PASS or graph end) is shown to the user.
-    in_critic_retry: bool = False   # True while inside a reflection-retry cycle
-    pending_text_parts: list[str] = []  # Buffer for tokens during retry
+    in_critic_retry: bool = False
+    pending_text_parts: list[str] = []
 
     try:
         LOGGER.info(
@@ -279,8 +266,8 @@ async def _stream_graph_events(
                                 "Further processing was stopped to prevent extra charges. "
                                 "Please recharge your wallet in Settings to continue."
                             )
-                            yield f"event: token\ndata: {json.dumps({'text': limit_msg})}\n\n"
-                            yield f"event: error\ndata: {json.dumps({'code': 'CREDIT_LIMIT_REACHED', 'message': 'AI credit limit reached.'})}\n\n"
+                            yield "token", {"text": limit_msg}
+                            yield "error", {"code": "CREDIT_LIMIT_REACHED", "message": "AI credit limit reached."}
                             result["error"] = "CREDIT_LIMIT_REACHED"
                             assistant_text_parts.append(limit_msg)
                             break
@@ -288,16 +275,10 @@ async def _stream_graph_events(
                         LOGGER.warning("model_usage_capture_failed", error=str(u_err))
 
             # --- Interrupt detection ---
-            # When langgraph.types.interrupt() fires, the runtime emits
-            # an on_chain_stream event whose chunk contains a __interrupt__
-            # key with the Interrupt objects. These are the payloads we
-            # passed to interrupt().
             chunk = data.get("chunk")
             if isinstance(chunk, dict) and "__interrupt__" in chunk:
                 for intr in chunk["__interrupt__"]:
                     interrupt_payloads.append(intr)
-                # The stream will end shortly after this event — no
-                # further processing needed for this event.
                 continue
 
             # --- Track tool usage ---
@@ -305,32 +286,23 @@ async def _stream_graph_events(
                 tools_used_set.add(name)
 
             # --- Critic-reflection cycle tracking ---
-            # When reflection node starts, we're in a retry cycle.
-            # Discard any already-buffered pending tokens (the rejected answer)
-            # and mark that subsequent think tokens should be buffered, not streamed.
             if kind == "on_chain_start" and name == "reflection":
                 in_critic_retry = True
-                pending_text_parts = []  # Discard rejected intermediate answer
-                # Emit a UI hint so the user sees something is happening
-                yield f"event: token\ndata: {json.dumps({'text': '\n_[Improving answer...]_\n'})}\n\n"
+                pending_text_parts = []
+                yield "token", {"text": "\n_[Improving answer...]_\n"}
                 continue
 
-            # When a new think node starts after reflection, clear the pending buffer
             if kind == "on_chain_start" and name == "think" and in_critic_retry:
                 pending_text_parts = []
                 continue
 
-            # When critic node ends with PASS (goal_status == complete), exit retry mode
-            # and flush the pending buffer to the stream.
             if kind == "on_chain_end" and name == "critic":
                 output = data.get("output", {}) or {}
                 critic_status = output.get("goal_status", "")
                 if critic_status in ("complete", "review") and in_critic_retry:
-                    # Critic passed — flush buffered tokens to the real stream
                     if pending_text_parts:
                         flushed = "".join(_flatten_text(p) for p in pending_text_parts)
-                        # Send as a single replacement token so UI can replace buffered content
-                        yield f"event: token\ndata: {json.dumps({'text': flushed})}\n\n"
+                        yield "token", {"text": flushed}
                         assistant_text_parts.extend(pending_text_parts)
                         pending_text_parts = []
                     if critic_status == "complete":
@@ -343,7 +315,6 @@ async def _stream_graph_events(
                 metadata = event.get("metadata", {}) or {}
                 node_name = metadata.get("langgraph_node")
 
-                # Suppress tokens from non-conversational nodes or hide_stream
                 if "hide_stream" in tags or (node_name and node_name not in {"think", "respond"}):
                     continue
 
@@ -351,25 +322,21 @@ async def _stream_graph_events(
                 if msg_chunk.content:
                     text = _flatten_text(msg_chunk.content)
                     if in_critic_retry:
-                        # Buffer tokens during retry — don't stream intermediate rejected answers
                         pending_text_parts.append(text)
                     else:
                         assistant_text_parts.append(text)
-                        yield f"event: token\ndata: {json.dumps({'text': text})}\n\n"
+                        yield "token", {"text": text}
 
             # --- Tool call events ---
             elif kind == "on_tool_start":
                 tool_input = data.get("input", {}) or {}
-                tool_payload = json.dumps(
-                    {
-                        "id": f"tool-{name}-{len(tools_used_set)}",
-                        "name": name,
-                        "args": tool_input,
-                        "status": "running",
-                    },
-                    default=_json_default,
-                )
-                yield f"event: tool_call\ndata: {tool_payload}\n\n"
+                tool_payload = {
+                    "id": f"tool-{name}-{len(tools_used_set)}",
+                    "name": name,
+                    "args": tool_input,
+                    "status": "running",
+                }
+                yield "tool_call", tool_payload
 
             elif kind == "on_tool_end":
                 tool_output = data.get("output", {})
@@ -380,74 +347,60 @@ async def _stream_graph_events(
                     tool_result = raw_val.dict()
                 else:
                     tool_result = raw_val
-                tool_payload = json.dumps(
-                    {
-                        "id": f"tool-{name}-{len(tools_used_set)}",
-                        "name": name,
-                        "result": tool_result,
-                        "status": "completed",
-                    },
-                    default=_json_default,
-                )
-                yield f"event: tool_call\ndata: {tool_payload}\n\n"
+                tool_payload = {
+                    "id": f"tool-{name}-{len(tools_used_set)}",
+                    "name": name,
+                    "result": tool_result,
+                    "status": "completed",
+                }
+                yield "tool_call", tool_payload
 
-                # --- Emit visual spec for analytical tools (charts, tables, KPI cards) ---
                 try:
                     from app.agent.tools.visual_builders import build_visual_from_tool
                     visual_spec = build_visual_from_tool(name, tool_result) or build_visual_from_tool(name, tool_output)
                     if visual_spec:
                         visuals_collected.append(visual_spec)
-                        yield f"event: visual\ndata: {json.dumps(visual_spec, default=_json_default)}\n\n"
+                        yield "visual", visual_spec
                 except Exception as viz_err:
                     LOGGER.warning("visual_spec_build_failed", tool=name, error=str(viz_err))
 
-                # --- Emit refresh / navigate for mutation tools ---
                 if name in MUTATION_TOOL_MAP:
                     mutation_meta = MUTATION_TOOL_MAP[name]
-                    refresh_payload = json.dumps({"section": mutation_meta["section"]}, default=_json_default)
-                    yield f"event: refresh\ndata: {refresh_payload}\n\n"
+                    yield "refresh", {"section": mutation_meta["section"]}
                     if mutation_meta.get("route"):
-                        nav_payload = json.dumps({"route": mutation_meta["route"]}, default=_json_default)
-                        yield f"event: navigate\ndata: {nav_payload}\n\n"
+                        yield "navigate", {"route": mutation_meta["route"]}
 
-                # --- Handle explicit navigation tool ---
                 if name == "tool_navigate_page":
-                    # For LangGraph, `data.get("input")` is the input dictionary passed to the tool
                     tool_input = data.get("input", {})
                     page = tool_input.get("page")
                     if page:
-                        nav_payload = json.dumps({"page": page}, default=_json_default)
-                        yield f"event: navigate\ndata: {nav_payload}\n\n"
+                        yield "navigate", {"page": page}
 
-                # --- Handle Billing Tools ---
                 if name == "tool_add_billing_item":
-                    # We need the barcode from the result
                     tool_result = data.get("output", {})
                     tool_input = data.get("input", {})
                     if isinstance(tool_result, dict) and tool_result.get("success"):
-                        add_payload = json.dumps({
+                        yield "billing_add", {
                             "barcode": tool_result.get("barcode"),
-                            "quantity": tool_input.get("quantity", 1)
-                        }, default=_json_default)
-                        yield f"event: billing_add\ndata: {add_payload}\n\n"
+                            "quantity": tool_input.get("quantity", 1),
+                        }
 
                 if name == "tool_generate_bill":
                     tool_input = data.get("input", {})
-                    gen_payload = json.dumps({
-                        "paymentMethod": tool_input.get("payment_method", "cash")
-                    }, default=_json_default)
-                    yield f"event: billing_generate\ndata: {gen_payload}\n\n"
+                    yield "billing_generate", {
+                        "paymentMethod": tool_input.get("payment_method", "cash"),
+                    }
 
             # --- Memory query notifications ---
             elif kind == "on_chain_start" and name == "memory_query":
-                yield f"event: token\ndata: {json.dumps({'text': '\n_[Loading long-term memory...]_\n'})}\n\n"
+                yield "token", {"text": "\n_[Loading long-term memory...]_\n"}
 
             elif kind == "on_chain_end" and name == "memory_query":
-                yield f"event: token\ndata: {json.dumps({'text': '\n_[Memory loaded.]_\n'})}\n\n"
+                yield "token", {"text": "\n_[Memory loaded.]_\n"}
 
-            # --- Planning node notifications & structured tool toggler ---
+            # --- Planning node notifications ---
             elif kind == "on_chain_start" and name == "planner":
-                yield f"event: token\ndata: {json.dumps({'text': '\n_[Formulating execution plan...]_\n'})}\n\n"
+                yield "token", {"text": "\n_[Formulating execution plan...]_\n"}
 
             elif kind == "on_chain_end" and name == "planner":
                 plan_output = data.get("output", {})
@@ -467,37 +420,34 @@ async def _stream_graph_events(
                         else:
                             steps_dict = {"Plan": str(steps_list)}
 
-                        plan_tool_payload = json.dumps(
-                            {
-                                "id": "tool-planner-plan",
-                                "name": "Goal & Strategy Plan",
-                                "args": {"Goal": goal_text} if goal_text else {},
-                                "result": steps_dict,
-                                "status": "completed",
-                            },
-                            default=_json_default,
-                        )
+                        plan_tool_payload = {
+                            "id": "tool-planner-plan",
+                            "name": "Goal & Strategy Plan",
+                            "args": {"Goal": goal_text} if goal_text else {},
+                            "result": steps_dict,
+                            "status": "completed",
+                        }
                         tools_used_set.add("planner")
-                        yield f"event: tool_call\ndata: {plan_tool_payload}\n\n"
-                        yield f"event: token\ndata: {json.dumps({'text': '\n_[Plan ready.]_\n'})}\n\n"
+                        yield "tool_call", plan_tool_payload
+                        yield "token", {"text": "\n_[Plan ready.]_\n"}
 
             # --- Subgraph events ---
             elif kind == "on_chain_start" and name in {"morning_briefing", "deep_inventory", "smart_restock", "web_research", "document_generation"}:
-                yield f"event: subgraph_start\ndata: {json.dumps({'name': name})}\n\n"
-            
+                yield "subgraph_start", {"name": name}
+
             elif kind == "on_chain_start" and name in {
-                "fetch_kpis", "fetch_alerts", "synthesize", 
-                "fetch_overview", "fetch_risks", "fetch_restock", 
+                "fetch_kpis", "fetch_alerts", "synthesize",
+                "fetch_overview", "fetch_risks", "fetch_restock",
                 "fetch_priorities", "fetch_supplier_context", "build_order",
                 "plan_research", "search_web", "select_sources", "fetch_sources",
                 "evaluate_evidence", "refine_query",
                 "prepare_document", "build_document_spec", "generate_document",
                 "validate_document", "repair_document", "upload_file", "create_result"
             }:
-                yield f"event: subgraph_step\ndata: {json.dumps({'name': name})}\n\n"
-                
+                yield "subgraph_step", {"name": name}
+
             elif kind == "on_chain_end" and name in {"morning_briefing", "deep_inventory", "smart_restock", "web_research", "document_generation"}:
-                yield f"event: subgraph_end\ndata: {json.dumps({'name': name})}\n\n"
+                yield "subgraph_end", {"name": name}
                 if name == "document_generation":
                     try:
                         chain_out = data.get("output", {})
@@ -505,17 +455,14 @@ async def _stream_graph_events(
                         visual_spec = build_visual_from_tool("invoke_document_generation", chain_out)
                         if visual_spec and not any(v.get("type") == "document_preview" and v.get("filename") == visual_spec.get("filename") for v in visuals_collected):
                             visuals_collected.append(visual_spec)
-                            yield f"event: visual\ndata: {json.dumps(visual_spec, default=_json_default)}\n\n"
-                            tool_payload = json.dumps(
-                                {
-                                    "id": f"tool-invoke_document_generation-{len(tools_used_set)}",
-                                    "name": "invoke_document_generation",
-                                    "result": chain_out,
-                                    "status": "completed",
-                                },
-                                default=_json_default,
-                            )
-                            yield f"event: tool_call\ndata: {tool_payload}\n\n"
+                            yield "visual", visual_spec
+                            tool_payload = {
+                                "id": f"tool-invoke_document_generation-{len(tools_used_set)}",
+                                "name": "invoke_document_generation",
+                                "result": chain_out,
+                                "status": "completed",
+                            }
+                            yield "tool_call", tool_payload
                     except Exception as viz_err:
                         LOGGER.warning("doc_gen_visual_spec_failed", error=str(viz_err))
 
@@ -529,29 +476,23 @@ async def _stream_graph_events(
                         visual_spec = build_visual_from_tool("invoke_document_generation", doc_output)
                         if visual_spec and not any(v.get("type") == "document_preview" and v.get("filename") == visual_spec.get("filename") for v in visuals_collected):
                             visuals_collected.append(visual_spec)
-                            yield f"event: visual\ndata: {json.dumps(visual_spec, default=_json_default)}\n\n"
-                            tool_payload = json.dumps(
-                                {
-                                    "id": f"tool-invoke_document_generation-{len(tools_used_set)}",
-                                    "name": "invoke_document_generation",
-                                    "result": doc_output,
-                                    "status": "completed",
-                                },
-                                default=_json_default,
-                            )
-                            yield f"event: tool_call\ndata: {tool_payload}\n\n"
+                            yield "visual", visual_spec
+                            tool_payload = {
+                                "id": f"tool-invoke_document_generation-{len(tools_used_set)}",
+                                "name": "invoke_document_generation",
+                                "result": doc_output,
+                                "status": "completed",
+                            }
+                            yield "tool_call", tool_payload
                 except Exception as r_err:
                     LOGGER.warning("subgraph_router_stream_visual_failed", error=str(r_err))
 
-
-        # Flush any buffered retry tokens if not already flushed
         if pending_text_parts:
             flushed = "".join(_flatten_text(p) for p in pending_text_parts)
-            yield f"event: token\ndata: {json.dumps({'text': flushed})}\n\n"
+            yield "token", {"text": flushed}
             assistant_text_parts.extend(pending_text_parts)
             pending_text_parts = []
 
-        # --- Post-stream: populate result dict ---
         result["full_response"] = "".join(
             _flatten_text(p) for p in assistant_text_parts
         )
@@ -569,10 +510,6 @@ async def _stream_graph_events(
             "graph_stream_interrupted",
             exc_info=True,
         )
-        # Defensive: astream_events should surface interrupts via
-        # __interrupt__ chunks, but if GraphInterrupt leaks to the
-        # caller, we can still extract the interrupt values from
-        # the exception's args[0] (a list of Interrupt objects).
         interrupts = exc.args[0] if exc.args else []
         for intr in interrupts:
             interrupt_payloads.append(intr)
@@ -592,7 +529,31 @@ async def _stream_graph_events(
         result["full_response"] = "".join(
             _flatten_text(p) for p in assistant_text_parts
         )
-        yield f"event: error\ndata: {json.dumps({'message': str(exc)}, default=_json_default)}\n\n"
+        yield "error", {"message": str(exc)}
+
+
+async def _stream_graph_events(
+    graph,
+    graph_input: Any,
+    config: dict,
+    *,
+    tools_used_set: set,
+    result: dict,
+    usage_collector: Optional[UsageCollector] = None,
+):
+    """
+    Async generator that processes LangGraph events and yields SSE-formatted strings.
+    Maintained for backward compatibility.
+    """
+    async for event_name, data in _stream_graph_events_raw(
+        graph,
+        graph_input,
+        config,
+        tools_used_set=tools_used_set,
+        result=result,
+        usage_collector=usage_collector,
+    ):
+        yield f"event: {event_name}\ndata: {json.dumps(data, default=_json_default)}\n\n"
 
 
 def _extract_interrupt_question(interrupt_payloads: list) -> str:
@@ -794,24 +755,266 @@ class CopilotStreamPayload(BaseModel):
     execution_id: str | None = None
 
 
-@router.post("/{store_id}/copilot/stream")
-async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, request: Request):
+async def _stream_copilot_events_core(
+    *,
+    store_id: str,
+    payload: CopilotStreamPayload,
+    user_id: str = "default_user",
+    is_owner: bool = True,
+    user_role: str = "Owner",
+    permissions: Optional[list[str]] = None,
+    execution_id: Optional[str] = None,
+):
     """
-    LangGraph agent Copilot endpoint (streaming SSE).
-
-    Each logical conversation is identified by a ``chat_id``. Starting a new
-    chat (no ``chat_id`` or an unknown one) creates a fresh LangGraph
-    ``thread_id`` so the agent gets a clean context window. Chat history is
-    persisted in MongoDB (``agent_chats`` + ``agent_chat_messages``).
-
-    Long-term memory (mem0) persistence runs as a background task AFTER the
-    SSE stream completes, so it never blocks the response.
-
-    The frontend sends ``chat_id`` (preferred) or the legacy ``session_id``.
+    Core async generator that processes copilot execution and yields
+    (event_name, data_dict) tuples.
+    Shared by SSE endpoint (POST /{store_id}/copilot/stream) and WebSocket
+    endpoints (/ws/copilot, /ws/chat, /{store_id}/copilot/ws).
     """
     from app.agent import build_graph, get_checkpointer, make_initial_state
     from app.agent.nodes.think_node import _is_conversation_meaningful
 
+    exec_id = (
+        payload.execution_id
+        or execution_id
+        or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    )
+    usage_collector = UsageCollector(
+        execution_id=exec_id,
+        user_id=user_id,
+        store_id=store_id,
+        feature="copilot",
+    )
+
+    chat_session = await get_or_create_chat_session(
+        user_id=user_id,
+        store_id=store_id,
+        chat_id=payload.chat_id,
+    )
+
+    chat_id = chat_session.chat_id
+    thread_id = chat_session.thread_id
+
+    await add_user_message(chat_id, payload.message)
+    tools_used_set: set[str] = set()
+
+    try:
+        nav_result = _detect_navigation_intent(payload.message)
+        if nav_result:
+            nav_route, nav_label = nav_result
+            reply = f"Sure! Navigating you to the **{nav_label}** page now. 🚀"
+            yield "token", {"text": reply}
+            yield "navigate", {"route": nav_route}
+
+            await add_assistant_message(chat_id, reply, metadata={"intent": "navigate", "route": nav_route})
+            chat_title = await ensure_chat_title(chat_id, payload.message)
+            yield "session", {
+                "chatId": chat_id,
+                "threadId": thread_id,
+                "title": chat_title,
+                "needsClarification": False,
+            }
+            usage_summary = usage_collector.get_summary(execution_status="completed")
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+            yield "done", {}
+            return
+
+        yield "session", {
+            "chatId": chat_id,
+            "threadId": thread_id,
+            "title": chat_session.title or "New Chat",
+            "needsClarification": False,
+        }
+
+        checkpointer = get_checkpointer()
+        graph = build_graph(checkpointer=checkpointer)
+
+        initial_state = make_initial_state(
+            user_id=user_id,
+            store_id=store_id,
+            user_prompt=payload.message,
+            thread_id=thread_id,
+            user_role=user_role,
+            is_owner=is_owner,
+            permissions=permissions or [],
+        )
+        if payload.language:
+            initial_state["user_preferences"] = {
+                **(initial_state.get("user_preferences") or {}),
+                "language": payload.language,
+            }
+
+        billing_cb = BillingUsageCallback(usage_collector)
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 100,
+            "callbacks": [billing_cb],
+        }
+
+        result: dict = {}
+
+        async for event_name, data in _stream_graph_events_raw(
+            graph,
+            initial_state,
+            config,
+            tools_used_set=tools_used_set,
+            result=result,
+            usage_collector=usage_collector,
+        ):
+            yield event_name, data
+
+        interrupt_payloads = result.get("interrupt_payloads", [])
+        if interrupt_payloads:
+            question = _extract_interrupt_question(interrupt_payloads)
+            if not question:
+                question = (
+                    "I need some additional information to give you "
+                    "an accurate answer. Could you help me with a few "
+                    "details?"
+                )
+
+            LOGGER.info(
+                "copilot_stream_clarification_needed",
+                store_id=store_id,
+                chat_id=chat_id,
+                prompt=question[:200],
+            )
+            yield "clarification", {
+                "question": question,
+                "chatId": chat_id,
+                "threadId": thread_id,
+            }
+
+            await add_assistant_message(
+                chat_id,
+                f"[CLARIFICATION] {question}",
+                metadata={
+                    "thread_id": thread_id,
+                    "needs_clarification": True,
+                },
+            )
+
+            chat_title = await ensure_chat_title(chat_id, payload.message)
+            yield "session", {
+                "chatId": chat_id,
+                "threadId": thread_id,
+                "title": chat_title,
+                "needsClarification": True,
+            }
+
+            usage_summary = usage_collector.get_summary(execution_status="interrupted")
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+            yield "done", {}
+            return
+
+        full_response = result.get("full_response", "")
+        grader_denied = False
+        if not full_response and not result.get("error"):
+            try:
+                final_state = await graph.aget_state(config)
+                values = final_state.values or {}
+                grader_denied = bool(values.get("grader_denied"))
+                state_answer = values.get("final_answer") or ""
+                if state_answer:
+                    yield "token", {"text": state_answer}
+                    full_response = state_answer
+                    LOGGER.info(
+                        "copilot_stream_fast_path_emitted",
+                        store_id=store_id,
+                        chat_id=chat_id,
+                        intent=values.get("intent", "unknown"),
+                        grader_denied=grader_denied,
+                    )
+            except Exception as exc:
+                LOGGER.warning(
+                    "copilot_stream_final_state_read_failed",
+                    store_id=store_id,
+                    chat_id=chat_id,
+                    error=str(exc),
+                )
+
+        if result.get("error"):
+            if result.get("error") == "CREDIT_LIMIT_REACHED":
+                limit_full_response = result.get("full_response") or ""
+                if limit_full_response:
+                    await add_assistant_message(
+                        chat_id,
+                        limit_full_response,
+                        metadata={"thread_id": thread_id, "stopped_reason": "CREDIT_LIMIT_REACHED"},
+                    )
+            usage_summary = usage_collector.get_summary(
+                execution_status="exhausted" if result.get("error") == "CREDIT_LIMIT_REACHED" else "error"
+            )
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+            yield "done", {}
+            return
+
+        if full_response:
+            await add_assistant_message(
+                chat_id,
+                full_response,
+                metadata={
+                    "thread_id": thread_id,
+                    "grader_denied": grader_denied,
+                    "visuals": result.get("visuals", []),
+                },
+            )
+
+        chat_title = await ensure_chat_title(chat_id, payload.message)
+        yield "session", {
+            "chatId": chat_id,
+            "threadId": thread_id,
+            "title": chat_title,
+            "needsClarification": False,
+        }
+
+        usage_summary = usage_collector.get_summary(execution_status="completed")
+        yield "usage", usage_summary
+        asyncio.create_task(report_usage_to_express(usage_summary))
+        yield "done", {}
+
+        should_persist = (
+            False
+            if grader_denied
+            else _is_conversation_meaningful(
+                user_prompt=payload.message,
+                final_answer=full_response,
+                tools_used=list(tools_used_set),
+                loop_count=0,
+            )
+        )
+        if should_persist and full_response:
+            messages = [
+                {"role": "user", "content": payload.message},
+                {"role": "assistant", "content": full_response},
+            ]
+            asyncio.create_task(
+                _persist_memory_background(
+                    user_id=user_id,
+                    store_id=store_id,
+                    messages=messages,
+                )
+            )
+
+    except (Exception, asyncio.CancelledError) as e:
+        yield "error", {"message": str(e)}
+        try:
+            usage_summary = usage_collector.get_summary(execution_status="error")
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+        except Exception:
+            pass
+        yield "done", {}
+
+
+@router.post("/{store_id}/copilot/stream")
+async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, request: Request):
+    """
+    LangGraph agent Copilot endpoint (streaming SSE).
+    """
     user_id = request.headers.get("x-user-id", "default_user")
     is_owner_header = request.headers.get("x-is-owner", "true")
     is_owner = is_owner_header.lower() == "true"
@@ -824,276 +1027,18 @@ async def get_copilot_stream(store_id: str, payload: CopilotStreamPayload, reque
         or request.headers.get("x-execution-id")
         or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     )
-    usage_collector = UsageCollector(
-        execution_id=execution_id,
-        user_id=user_id,
-        store_id=store_id,
-        feature="copilot",
-    )
-
-    # Resolve the chat session (existing or new)
-    chat_session = await get_or_create_chat_session(
-        user_id=user_id,
-        store_id=store_id,
-        chat_id=payload.chat_id,
-    )
-
-    chat_id = chat_session.chat_id
-    thread_id = chat_session.thread_id
-
-    # Persist the user message
-    await add_user_message(chat_id, payload.message)
-
-    # Track tool usage (mutated in place by the shared SSE helper)
-    tools_used_set: set[str] = set()
 
     async def event_generator():
-        try:
-            # ── Navigation fast-path ──────────────────────────────────────────
-            # Detect explicit "go to X page" style requests and immediately
-            # emit a navigate event + friendly reply, bypassing the full graph.
-            nav_result = _detect_navigation_intent(payload.message)
-            if nav_result:
-                nav_route, nav_label = nav_result
-                reply = f"Sure! Navigating you to the **{nav_label}** page now. 🚀"
-                yield f"event: token\ndata: {json.dumps({'text': reply})}\n\n"
-                nav_payload = json.dumps({"route": nav_route}, default=_json_default)
-                yield f"event: navigate\ndata: {nav_payload}\n\n"
-
-                await add_assistant_message(chat_id, reply, metadata={"intent": "navigate", "route": nav_route})
-                chat_title = await ensure_chat_title(chat_id, payload.message)
-                session_data = json.dumps({"chatId": chat_id, "threadId": thread_id, "title": chat_title, "needsClarification": False}, default=_json_default)
-                yield f"event: session\ndata: {session_data}\n\n"
-
-                # Navigation fast path emits 0-credit usage summary
-                usage_summary = usage_collector.get_summary(execution_status="completed")
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
-
-                yield "event: done\ndata: {}\n\n"
-                return
-            # -- End navigation fast-path --------------------------------------
-
-            # Immediately emit session metadata with chat_id at the start of stream
-            # so the client can transition URL from /chat to /chat/:chatId right away
-            initial_session = json.dumps({
-                "chatId": chat_id,
-                "threadId": thread_id,
-                "title": chat_session.title or "New Chat",
-                "needsClarification": False,
-            }, default=_json_default)
-            yield f"event: session\ndata: {initial_session}\n\n"
-
-            checkpointer = get_checkpointer()
-            graph = build_graph(checkpointer=checkpointer)
-
-            initial_state = make_initial_state(
-                user_id=user_id,
-                store_id=store_id,
-                user_prompt=payload.message,
-                thread_id=thread_id,
-                user_role=user_role,
-                is_owner=is_owner,
-                permissions=permissions,
-            )
-            if payload.language:
-                initial_state["user_preferences"] = {
-                    **(initial_state.get("user_preferences") or {}),
-                    "language": payload.language,
-                }
-
-            billing_cb = BillingUsageCallback(usage_collector)
-            config = {
-                "configurable": {"thread_id": thread_id},
-                "recursion_limit": 100,
-                "callbacks": [billing_cb],
-            }
-
-            result: dict = {}
-
-            # Stream graph events via the shared helper — yields SSE
-            # strings for tokens, tool calls, memory notifications, and
-            # error events. Interrupts are captured in result["interrupt_payloads"].
-            async for sse in _stream_graph_events(
-                graph,
-                initial_state,
-                config,
-                tools_used_set=tools_used_set,
-                result=result,
-                usage_collector=usage_collector,
-            ):
-                yield sse
-
-            # --- Interrupt handling ---
-            # When langgraph.types.interrupt() fires inside the interrupt_node,
-            # the stream ends and the interrupt payloads are captured by the
-            # helper. We detect this and emit a clarification SSE event.
-            #
-            # The graph is now PAUSED (not terminated) — the client must
-            # call POST /{store_id}/clarify to resume with Command(resume=...).
-            interrupt_payloads = result.get("interrupt_payloads", [])
-
-            if interrupt_payloads:
-                question = _extract_interrupt_question(interrupt_payloads)
-                if not question:
-                    question = (
-                        "I need some additional information to give you "
-                        "an accurate answer. Could you help me with a few "
-                        "details?"
-                    )
-
-                LOGGER.info(
-                    "copilot_stream_clarification_needed",
-                    store_id=store_id,
-                    chat_id=chat_id,
-                    prompt=question[:200],
-                )
-
-                clarification_event = json.dumps({
-                    "question": question,
-                    "chatId": chat_id,
-                    "threadId": thread_id,
-                }, default=_json_default)
-                yield f"event: clarification\ndata: {clarification_event}\n\n"
-
-                await add_assistant_message(
-                    chat_id,
-                    f"[CLARIFICATION] {question}",
-                    metadata={
-                        "thread_id": thread_id,
-                        "needs_clarification": True,
-                    },
-                )
-
-                session_data = json.dumps({
-                    "chatId": chat_id,
-                    "threadId": thread_id,
-                    "title": await ensure_chat_title(chat_id, payload.message),
-                    "needsClarification": True,
-                }, default=_json_default)
-                yield f"event: session\ndata: {session_data}\n\n"
-
-                # Interrupted for clarification: emit intermediate usage
-                usage_summary = usage_collector.get_summary(execution_status="interrupted")
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
-
-                yield "event: done\ndata: {}\n\n"
-                return
-
-            # --- Normal completion path ---
-            full_response = result.get("full_response", "")
-
-            # When no tokens were streamed (grader denial, greeting fast-path,
-            # or any other short-circuit node), fall back to final_answer stored
-            # in graph state and emit it as token events so the UI shows it.
-            grader_denied = False
-            if not full_response and not result.get("error"):
-                try:
-                    final_state = await graph.aget_state(config)
-                    values = final_state.values or {}
-                    grader_denied = bool(values.get("grader_denied"))
-                    state_answer = values.get("final_answer") or ""
-                    if state_answer:
-                        yield f"event: token\ndata: {json.dumps({'text': state_answer})}\n\n"
-                        full_response = state_answer
-                        LOGGER.info(
-                            "copilot_stream_fast_path_emitted",
-                            store_id=store_id,
-                            chat_id=chat_id,
-                            intent=values.get("intent", "unknown"),
-                            grader_denied=grader_denied,
-                        )
-                except Exception as exc:
-                    LOGGER.warning(
-                        "copilot_stream_final_state_read_failed",
-                        store_id=store_id,
-                        chat_id=chat_id,
-                        error=str(exc),
-                    )
-
-            if result.get("error"):
-                if result.get("error") == "CREDIT_LIMIT_REACHED":
-                    limit_full_response = result.get("full_response") or ""
-                    if limit_full_response:
-                        await add_assistant_message(
-                            chat_id,
-                            limit_full_response,
-                            metadata={"thread_id": thread_id, "stopped_reason": "CREDIT_LIMIT_REACHED"},
-                        )
-                usage_summary = usage_collector.get_summary(
-                    execution_status="exhausted" if result.get("error") == "CREDIT_LIMIT_REACHED" else "error"
-                )
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
-                yield "event: done\ndata: {}\n\n"
-                return
-
-            # Persist the assistant response to chat history
-            if full_response:
-                await add_assistant_message(
-                    chat_id,
-                    full_response,
-                    metadata={
-                        "thread_id": thread_id,
-                        "grader_denied": grader_denied,
-                        "visuals": result.get("visuals", []),
-                    },
-                )
-
-            chat_title = await ensure_chat_title(chat_id, payload.message)
-
-            session_data = json.dumps({
-                "chatId": chat_id,
-                "threadId": thread_id,
-                "title": chat_title,
-                "needsClarification": False,
-            }, default=_json_default)
-            yield f"event: session\ndata: {session_data}\n\n"
-
-            # Emit final verified usage summary before done
-            usage_summary = usage_collector.get_summary(execution_status="completed")
-            yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-            asyncio.create_task(report_usage_to_express(usage_summary))
-
-            yield "event: done\ndata: {}\n\n"
-
-            # After SSE stream is fully sent, persist to mem0 in background
-            # so it never blocks the client response. Never persist a
-            # refused (potentially harmful) exchange to long-term memory.
-            should_persist = (
-                False
-                if grader_denied
-                else _is_conversation_meaningful(
-                    user_prompt=payload.message,
-                    final_answer=full_response,
-                    tools_used=list(tools_used_set),
-                    loop_count=0,
-                )
-            )
-            if should_persist and full_response:
-                messages = [
-                    {"role": "user", "content": payload.message},
-                    {"role": "assistant", "content": full_response},
-                ]
-                asyncio.create_task(
-                    _persist_memory_background(
-                        user_id=user_id,
-                        store_id=store_id,
-                        messages=messages,
-                    )
-                )
-
-        except (Exception, asyncio.CancelledError) as e:
-            error_data = json.dumps({"message": str(e)}, default=_json_default)
-            yield f"event: error\ndata: {error_data}\n\n"
-            try:
-                usage_summary = usage_collector.get_summary(execution_status="error")
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
-            except Exception:
-                pass
-            yield "event: done\ndata: {}\n\n"
+        async for event_name, data in _stream_copilot_events_core(
+            store_id=store_id,
+            payload=payload,
+            user_id=user_id,
+            is_owner=is_owner,
+            user_role=user_role,
+            permissions=permissions,
+            execution_id=execution_id,
+        ):
+            yield f"event: {event_name}\ndata: {json.dumps(data, default=_json_default)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -1117,40 +1062,30 @@ class ClarifyRequest(BaseModel):
     execution_id: str | None = None
 
 
-@router.post("/{store_id}/clarify")
-async def clarify(
+async def _stream_clarify_events_core(
+    *,
     store_id: str,
-    request: Request,
     payload: ClarifyRequest,
+    user_id: str = "default_user",
+    execution_id: Optional[str] = None,
 ):
     """
-    User responds to a clarification question from the agent.
-
-    This RESUMES the previously interrupted graph using
-    ``Command(resume=<answer>)`` with the same ``thread_id``.
-    LangGraph loads the saved checkpoint, re-executes the interrupt
-    node from the beginning, and the ``interrupt()`` call returns the
-    user's answer. The answer is stored in ``clarification_history``
-    and the graph loops back to ``think`` so the LLM can incorporate
-    the answer and continue.
-
-    If the graph is not in an interrupted state (e.g. it already
-    completed or the checkpoint was lost), an error SSE event is
-    emitted and the client should start a new conversation.
+    Core async generator that processes clarification resumes and yields
+    (event_name, data_dict) tuples.
+    Shared by SSE endpoint (POST /{store_id}/clarify) and WebSocket
+    endpoints (/ws/copilot, /ws/chat, /{store_id}/copilot/ws).
     """
     from app.agent import build_graph, get_checkpointer
     from langgraph.types import Command
     from app.agent.nodes.think_node import _is_conversation_meaningful
 
-    user_id = request.headers.get("x-user-id", "default_user")
-
-    execution_id = (
+    exec_id = (
         payload.execution_id
-        or request.headers.get("x-execution-id")
+        or execution_id
         or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     )
     usage_collector = UsageCollector(
-        execution_id=execution_id,
+        execution_id=exec_id,
         user_id=user_id,
         store_id=store_id,
         feature="copilot",
@@ -1162,11 +1097,9 @@ async def clarify(
         chat_id=payload.chat_id,
         answer_preview=payload.answer[:100] if payload.answer else "",
         user_id=user_id,
-        execution_id=execution_id,
+        execution_id=exec_id,
     )
 
-    # Resolve the chat session (existing — the graph must already be
-    # interrupted on this thread for the resume to work).
     chat_session = await get_or_create_chat_session(
         user_id=user_id,
         store_id=store_id,
@@ -1176,17 +1109,7 @@ async def clarify(
     chat_id = chat_session.chat_id
     thread_id = chat_session.thread_id
 
-    LOGGER.info(
-        "clarify_session_resolved",
-        chat_id=chat_id,
-        thread_id=thread_id,
-        user_id=user_id,
-    )
-
-    # Persist the user's clarification answer to chat history
     await add_user_message(chat_id, payload.answer)
-
-    LOGGER.info("clarify_message_persisted", chat_id=chat_id)
 
     graph = build_graph(checkpointer=get_checkpointer())
     billing_cb = BillingUsageCallback(usage_collector)
@@ -1197,239 +1120,194 @@ async def clarify(
     }
 
     tools_used_set: set[str] = set()
+    result: dict = {}
 
-    async def event_generator():
-        result: dict = {}
-
+    try:
         try:
-            LOGGER.info("clarify_guard_check_start", chat_id=chat_id, thread_id=thread_id)
-            # ----------------------------------------------------------
-            # Guard: verify the graph is actually interrupted before
-            # attempting a resume. If state.next is non-empty, the
-            # runtime has a pending node to execute (the interrupted
-            # node). If it's empty, the graph already completed.
-            # ----------------------------------------------------------
-            try:
-                current_state = await graph.aget_state(config)
-                state_next = list(current_state.next) if current_state.next else []
-                state_values_keys = list((current_state.values or {}).keys()) if current_state.values else []
-                LOGGER.info(
-                    "clarify_guard_check_result",
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    state_next=state_next,
-                    has_values=bool(current_state.values),
-                    value_keys=state_values_keys[:10],
-                )
-                if not current_state.next:
-                    LOGGER.warning(
-                        "clarify_no_pending_interrupt",
-                        store_id=store_id,
-                        chat_id=chat_id,
-                        thread_id=thread_id,
-                    )
-                    error_data = json.dumps(
-                        {"message": "No pending clarification to resume. Please start a new conversation."},
-                        default=_json_default,
-                    )
-                    yield f"event: error\ndata: {error_data}\n\n"
-                    yield "event: done\ndata: {}\n\n"
-                    return
-            except Exception as state_exc:
+            current_state = await graph.aget_state(config)
+            if not current_state.next:
                 LOGGER.warning(
-                    "clarify_state_check_failed",
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    error=str(state_exc),
-                    exc_info=True,
-                )
-                error_data = json.dumps(
-                    {"message": "Could not load graph state for resume. Please start a new conversation."},
-                    default=_json_default,
-                )
-                yield f"event: error\ndata: {error_data}\n\n"
-                yield "event: done\ndata: {}\n\n"
-                return
-
-            LOGGER.info(
-                "clarify_resume_start",
-                chat_id=chat_id,
-                thread_id=thread_id,
-                answer_preview=payload.answer[:100],
-            )
-
-            # ----------------------------------------------------------
-            # Resume the interrupted graph.
-            #
-            # Command(resume=<answer>) is the ONLY Command pattern
-            # intended as input to invoke()/astream_events(). The
-            # runtime matches the resume value to the pending interrupt()
-            # call by index, and interrupt() returns the answer inside
-            # the interrupt_node.
-            # ----------------------------------------------------------
-            async for sse in _stream_graph_events(
-                graph,
-                Command(resume=payload.answer),
-                config,
-                tools_used_set=tools_used_set,
-                result=result,
-                usage_collector=usage_collector,
-            ):
-                yield sse
-
-            LOGGER.info(
-                "clarify_resume_completed",
-                chat_id=chat_id,
-                thread_id=thread_id,
-                interrupt_payloads=len(result.get("interrupt_payloads", [])),
-                has_error=bool(result.get("error")),
-            )
-
-            # ----------------------------------------------------------
-            # Handle recursive clarification (the LLM may still need
-            # more information after incorporating the first answer).
-            # ----------------------------------------------------------
-            interrupt_payloads = result.get("interrupt_payloads", [])
-            if interrupt_payloads:
-                question = _extract_interrupt_question(interrupt_payloads)
-                if not question:
-                    question = "I need more information."
-
-                LOGGER.info(
-                    "clarify_recursive_clarification",
+                    "clarify_no_pending_interrupt",
                     store_id=store_id,
                     chat_id=chat_id,
+                    thread_id=thread_id,
                 )
-
-                yield f"event: clarification\ndata: {json.dumps({'question': question, 'chatId': chat_id, 'threadId': thread_id}, default=_json_default)}\n\n"
-
-                await add_assistant_message(
-                    chat_id,
-                    f"[CLARIFICATION] {question}",
-                    metadata={"thread_id": thread_id, "needs_clarification": True},
-                )
-
-                session_data = json.dumps(
-                    {
-                        "chatId": chat_id,
-                        "threadId": thread_id,
-                        "title": await ensure_chat_title(chat_id, payload.answer),
-                        "needsClarification": True,
-                    },
-                    default=_json_default,
-                )
-                yield f"event: session\ndata: {session_data}\n\n"
-
-                # Recursive clarification: emit intermediate usage
-                usage_summary = usage_collector.get_summary(execution_status="interrupted")
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
-
-                yield "event: done\ndata: {}\n\n"
+                yield "error", {"message": "No pending clarification to resume. Please start a new conversation."}
+                yield "done", {}
                 return
-
-            # ----------------------------------------------------------
-            # Normal completion — the graph finished without further
-            # clarification needs.
-            # ----------------------------------------------------------
-            full_response = result.get("full_response", "")
-
-            # Fast-path fallback (no tokens may have streamed: grader denial, greeting, etc.)
-            grader_denied = False
-            if not full_response and not result.get("error"):
-                try:
-                    final_state = await graph.aget_state(config)
-                    values = final_state.values or {}
-                    grader_denied = bool(values.get("grader_denied"))
-                    state_answer = values.get("final_answer") or ""
-                    if state_answer:
-                        yield f"event: token\ndata: {json.dumps({'text': state_answer})}\n\n"
-                        full_response = state_answer
-                except Exception:
-                    pass
-
-            if result.get("error"):
-                if result.get("error") == "CREDIT_LIMIT_REACHED":
-                    limit_full_response = result.get("full_response") or ""
-                    if limit_full_response:
-                        await add_assistant_message(
-                            chat_id,
-                            limit_full_response,
-                            metadata={"thread_id": thread_id, "stopped_reason": "CREDIT_LIMIT_REACHED"},
-                        )
-                usage_summary = usage_collector.get_summary(
-                    execution_status="exhausted" if result.get("error") == "CREDIT_LIMIT_REACHED" else "error"
-                )
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
-                yield "event: done\ndata: {}\n\n"
-                return
-
-            # Persist the assistant response to chat history
-            if full_response:
-                await add_assistant_message(
-                    chat_id,
-                    full_response,
-                    metadata={"thread_id": thread_id, "visuals": result.get("visuals", [])},
-                )
-
-            # Emit session metadata
-            session_data = json.dumps(
-                {
-                    "chatId": chat_id,
-                    "threadId": thread_id,
-                    "title": await ensure_chat_title(chat_id, payload.answer),
-                },
-                default=_json_default,
-            )
-            yield f"event: session\ndata: {session_data}\n\n"
-
-            # Emit usage before done
-            usage_summary = usage_collector.get_summary(execution_status="completed")
-            yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-            asyncio.create_task(report_usage_to_express(usage_summary))
-
-            yield "event: done\ndata: {}\n\n"
-
-            # Background memory persistence
-            should_persist = _is_conversation_meaningful(
-                user_prompt=payload.answer,
-                final_answer=full_response,
-                tools_used=list(tools_used_set),
-                loop_count=0,
-            )
-            if should_persist and full_response:
-                messages = [
-                    {"role": "user", "content": payload.answer},
-                    {"role": "assistant", "content": full_response},
-                ]
-                asyncio.create_task(
-                    _persist_memory_background(
-                        user_id=user_id,
-                        store_id=store_id,
-                        messages=messages,
-                    )
-                )
-
-        except (Exception, asyncio.CancelledError) as e:
-            LOGGER.error(
-                "clarify_stream_error",
+        except Exception as state_exc:
+            LOGGER.warning(
+                "clarify_state_check_failed",
                 chat_id=chat_id,
                 thread_id=thread_id,
-                error=str(e),
+                error=str(state_exc),
                 exc_info=True,
             )
-            error_data = json.dumps({"message": str(e)}, default=_json_default)
-            yield f"event: error\ndata: {error_data}\n\n"
+            yield "error", {"message": "Could not load graph state for resume. Please start a new conversation."}
+            yield "done", {}
+            return
+
+        LOGGER.info(
+            "clarify_resume_start",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            answer_preview=payload.answer[:100],
+        )
+
+        async for event_name, data in _stream_graph_events_raw(
+            graph,
+            Command(resume=payload.answer),
+            config,
+            tools_used_set=tools_used_set,
+            result=result,
+            usage_collector=usage_collector,
+        ):
+            yield event_name, data
+
+        interrupt_payloads = result.get("interrupt_payloads", [])
+        if interrupt_payloads:
+            question = _extract_interrupt_question(interrupt_payloads)
+            if not question:
+                question = "I need more information."
+
+            yield "clarification", {
+                "question": question,
+                "chatId": chat_id,
+                "threadId": thread_id,
+            }
+
+            await add_assistant_message(
+                chat_id,
+                f"[CLARIFICATION] {question}",
+                metadata={"thread_id": thread_id, "needs_clarification": True},
+            )
+
+            chat_title = await ensure_chat_title(chat_id, payload.answer)
+            yield "session", {
+                "chatId": chat_id,
+                "threadId": thread_id,
+                "title": chat_title,
+                "needsClarification": True,
+            }
+
+            usage_summary = usage_collector.get_summary(execution_status="interrupted")
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+            yield "done", {}
+            return
+
+        full_response = result.get("full_response", "")
+        grader_denied = False
+        if not full_response and not result.get("error"):
             try:
-                usage_summary = usage_collector.get_summary(execution_status="error")
-                yield f"event: usage\ndata: {json.dumps(usage_summary, default=_json_default)}\n\n"
-                asyncio.create_task(report_usage_to_express(usage_summary))
+                final_state = await graph.aget_state(config)
+                values = final_state.values or {}
+                grader_denied = bool(values.get("grader_denied"))
+                state_answer = values.get("final_answer") or ""
+                if state_answer:
+                    yield "token", {"text": state_answer}
+                    full_response = state_answer
             except Exception:
                 pass
-            yield "event: done\ndata: {}\n\n"
 
-    LOGGER.info("clarify_sse_response_returned", chat_id=chat_id)
+        if result.get("error"):
+            if result.get("error") == "CREDIT_LIMIT_REACHED":
+                limit_full_response = result.get("full_response") or ""
+                if limit_full_response:
+                    await add_assistant_message(
+                        chat_id,
+                        limit_full_response,
+                        metadata={"thread_id": thread_id, "stopped_reason": "CREDIT_LIMIT_REACHED"},
+                    )
+            usage_summary = usage_collector.get_summary(
+                execution_status="exhausted" if result.get("error") == "CREDIT_LIMIT_REACHED" else "error"
+            )
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+            yield "done", {}
+            return
+
+        if full_response:
+            await add_assistant_message(
+                chat_id,
+                full_response,
+                metadata={"thread_id": thread_id, "visuals": result.get("visuals", [])},
+            )
+
+        chat_title = await ensure_chat_title(chat_id, payload.answer)
+        yield "session", {
+            "chatId": chat_id,
+            "threadId": thread_id,
+            "title": chat_title,
+            "needsClarification": False,
+        }
+
+        usage_summary = usage_collector.get_summary(execution_status="completed")
+        yield "usage", usage_summary
+        asyncio.create_task(report_usage_to_express(usage_summary))
+        yield "done", {}
+
+        should_persist = _is_conversation_meaningful(
+            user_prompt=payload.answer,
+            final_answer=full_response,
+            tools_used=list(tools_used_set),
+            loop_count=0,
+        )
+        if should_persist and full_response:
+            messages = [
+                {"role": "user", "content": payload.answer},
+                {"role": "assistant", "content": full_response},
+            ]
+            asyncio.create_task(
+                _persist_memory_background(
+                    user_id=user_id,
+                    store_id=store_id,
+                    messages=messages,
+                )
+            )
+
+    except (Exception, asyncio.CancelledError) as e:
+        LOGGER.error(
+            "clarify_stream_error",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            error=str(e),
+            exc_info=True,
+        )
+        yield "error", {"message": str(e)}
+        try:
+            usage_summary = usage_collector.get_summary(execution_status="error")
+            yield "usage", usage_summary
+            asyncio.create_task(report_usage_to_express(usage_summary))
+        except Exception:
+            pass
+        yield "done", {}
+
+
+@router.post("/{store_id}/clarify")
+async def clarify(
+    store_id: str,
+    request: Request,
+    payload: ClarifyRequest,
+):
+    """
+    User responds to a clarification question from the agent (streaming SSE).
+    """
+    user_id = request.headers.get("x-user-id", "default_user")
+    execution_id = (
+        payload.execution_id
+        or request.headers.get("x-execution-id")
+        or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    )
+
+    async def event_generator():
+        async for event_name, data in _stream_clarify_events_core(
+            store_id=store_id,
+            payload=payload,
+            user_id=user_id,
+            execution_id=execution_id,
+        ):
+            yield f"event: {event_name}\ndata: {json.dumps(data, default=_json_default)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -1439,6 +1317,164 @@ async def clarify(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Copilot & Chat Endpoints (Zero Proxy Buffering)
+# ---------------------------------------------------------------------------
+
+async def _handle_copilot_websocket_session(
+    websocket: WebSocket,
+    default_store_id: Optional[str] = None,
+    default_user_id: Optional[str] = None,
+    default_is_owner: Optional[bool] = None,
+    default_user_role: Optional[str] = None,
+    default_permissions: Optional[list[str]] = None,
+):
+    """
+    Session handler for Copilot WebSockets. Streams tokens and events
+    sub-millisecond without proxy chunk buffering. Supports interactive
+    turn-taking (message, clarify, ping).
+    """
+    await websocket.accept()
+    LOGGER.info(
+        "copilot_websocket_connected",
+        store_id=default_store_id,
+        user_id=default_user_id,
+    )
+    try:
+        while True:
+            try:
+                data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                LOGGER.info("copilot_websocket_client_disconnected", store_id=default_store_id)
+                break
+            except Exception as e:
+                LOGGER.warning("copilot_websocket_receive_error", error=str(e))
+                break
+
+            action = data.get("action") or ("clarify" if "answer" in data else "message")
+            if action == "ping":
+                await websocket.send_json({"event": "pong", "data": {}})
+                continue
+
+            store_id = data.get("store_id") or default_store_id or ""
+            user_id = data.get("user_id") or default_user_id or "default_user"
+            is_owner = (
+                data.get("is_owner")
+                if data.get("is_owner") is not None
+                else (default_is_owner if default_is_owner is not None else True)
+            )
+            user_role = data.get("user_role") or default_user_role or ("Owner" if is_owner else "Employee")
+            perms_raw = data.get("permissions") or default_permissions or []
+            if isinstance(perms_raw, str):
+                perms = [p.strip() for p in perms_raw.split(",") if p.strip()]
+            else:
+                perms = list(perms_raw)
+
+            execution_id = data.get("execution_id") or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+
+            if action == "clarify":
+                clarify_payload = ClarifyRequest(
+                    chat_id=data.get("chat_id") or "",
+                    answer=data.get("answer") or "",
+                    execution_id=execution_id,
+                )
+                async for event_name, event_data in _stream_clarify_events_core(
+                    store_id=store_id,
+                    payload=clarify_payload,
+                    user_id=user_id,
+                    execution_id=execution_id,
+                ):
+                    await websocket.send_json({"event": event_name, "data": event_data})
+            else:
+                stream_payload = CopilotStreamPayload(
+                    message=data.get("message") or "",
+                    chat_id=data.get("chat_id"),
+                    session_id=data.get("session_id"),
+                    language=data.get("language") or "en",
+                    execution_id=execution_id,
+                )
+                async for event_name, event_data in _stream_copilot_events_core(
+                    store_id=store_id,
+                    payload=stream_payload,
+                    user_id=user_id,
+                    is_owner=is_owner,
+                    user_role=user_role,
+                    permissions=perms,
+                    execution_id=execution_id,
+                ):
+                    await websocket.send_json({"event": event_name, "data": event_data})
+
+    except WebSocketDisconnect:
+        LOGGER.info("copilot_websocket_disconnected", store_id=default_store_id)
+    except Exception as exc:
+        LOGGER.error("copilot_websocket_error", error=str(exc), exc_info=True)
+        try:
+            await websocket.send_json({"event": "error", "data": {"message": str(exc)}})
+            await websocket.send_json({"event": "done", "data": {}})
+        except Exception:
+            pass
+
+
+@router.websocket("/ws/copilot")
+async def copilot_websocket_endpoint(
+    websocket: WebSocket,
+    store_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    is_owner: Optional[bool] = Query(None),
+    user_role: Optional[str] = Query(None),
+    permissions: Optional[str] = Query(None),
+):
+    perms_list = [p.strip() for p in permissions.split(",") if p.strip()] if permissions else None
+    await _handle_copilot_websocket_session(
+        websocket=websocket,
+        default_store_id=store_id,
+        default_user_id=user_id,
+        default_is_owner=is_owner,
+        default_user_role=user_role,
+        default_permissions=perms_list,
+    )
+
+
+@router.websocket("/ws/chat")
+async def chat_websocket_endpoint(
+    websocket: WebSocket,
+    store_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    is_owner: Optional[bool] = Query(None),
+    user_role: Optional[str] = Query(None),
+    permissions: Optional[str] = Query(None),
+):
+    perms_list = [p.strip() for p in permissions.split(",") if p.strip()] if permissions else None
+    await _handle_copilot_websocket_session(
+        websocket=websocket,
+        default_store_id=store_id,
+        default_user_id=user_id,
+        default_is_owner=is_owner,
+        default_user_role=user_role,
+        default_permissions=perms_list,
+    )
+
+
+@router.websocket("/{store_id}/copilot/ws")
+async def store_copilot_websocket_endpoint(
+    websocket: WebSocket,
+    store_id: str,
+    user_id: Optional[str] = Query(None),
+    is_owner: Optional[bool] = Query(None),
+    user_role: Optional[str] = Query(None),
+    permissions: Optional[str] = Query(None),
+):
+    perms_list = [p.strip() for p in permissions.split(",") if p.strip()] if permissions else None
+    await _handle_copilot_websocket_session(
+        websocket=websocket,
+        default_store_id=store_id,
+        default_user_id=user_id,
+        default_is_owner=is_owner,
+        default_user_role=user_role,
+        default_permissions=perms_list,
     )
 
 
