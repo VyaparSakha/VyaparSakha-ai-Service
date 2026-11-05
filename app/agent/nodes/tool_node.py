@@ -77,8 +77,9 @@ async def tool_node(state: VyaparAgentState) -> Dict[str, Any]:
 
         t0 = time.perf_counter()
         try:
-            # Ensure store_id is always passed to every tool
-            args = dict(call["arguments"])
+            # Ensure store_id is always passed to every tool (support arguments, tool_input, args)
+            raw_args = call.get("arguments") if "arguments" in call else (call.get("tool_input") or call.get("args") or {})
+            args = dict(raw_args)
             if "store_id" not in args:
                 args["store_id"] = store_id
 

@@ -88,11 +88,16 @@ def _route_after_memory_query(state: VyaparAgentState) -> str:
 def _route_after_intent(state: VyaparAgentState) -> str:
     """
     Conditional edge function called after intent_node.
-    - greeting intent → END (intent_node already set final_answer)
-    - everything else → memory_query
+    - goal_status == "complete" → END (intent_node already set final_answer, e.g. greeting/harmful)
+    - pending_tool_calls set → tool (execute retrieved semantic tools directly for 2-LLM-call fast path)
+    - memory_query_needed → memory_query
+    - requires_planning → planner
+    - default → think
     """
     if state.get("goal_status") == "complete":
         return "__end__"
+    if state.get("pending_tool_calls"):
+        return "tool"
     if state.get("memory_query_needed", False) and state.get("intent") in {"memory", "mixed"}:
         return "memory_query"
     if state.get("requires_planning", False) and not state.get("plan"):
@@ -234,6 +239,7 @@ def build_graph(checkpointer=None):
         _route_after_intent,
         {
             "__end__": END,
+            "tool": "tool",
             "think": "think",
             "memory_query": "memory_query",
             "planner": "planner",

@@ -340,7 +340,76 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "response_metadata": {"intent": intent, "fast_path": True, "grader_verdict": intent},
         }
 
-    # 8. Standard active business query
+    # 8. Fast-path: Semantic tool retrieval & pre-dispatch for live_data queries (2-LLM-call architecture)
+    if intent == "live_data" and not requires_planning and not needs_memory:
+        try:
+            from app.agent.tools.semantic_index import get_semantic_tools_for_query
+            from app.agent.tools.registry import is_tool_allowed_for_user
+            import uuid
+
+            is_owner = state.get("is_owner", True)
+            permissions = state.get("permissions", [])
+            store_id = state.get("store_id")
+
+            # Fast 12ms semantic retrieval of top matching tools
+            matched_tools = get_semantic_tools_for_query(prompt, top_k=4)
+            allowed_semantic_tools = [
+                t for t in matched_tools
+                if is_tool_allowed_for_user(t.name, is_owner=is_owner, permissions=permissions)
+            ]
+
+            if allowed_semantic_tools and llm:
+                LOGGER.info("intent_semantic_tool_dispatch_start", tools=[t.name for t in allowed_semantic_tools])
+                tool_llm = llm.bind_tools(allowed_semantic_tools, tool_choice="any")
+                dispatch_sys = (
+                    f"You are the Vyapar Sakha fast tool dispatcher for store ID '{store_id}'.\n"
+                    f"Given the merchant query, call the required live data tool(s) with accurate arguments.\n"
+                    f"Always pass store_id='{store_id}' if accepted by the tool.\n"
+                    f"For sales/revenue trends or summaries, call both get_sales_summary and get_daily_sales_trend if relevant."
+                )
+                tool_dispatch_msgs = [
+                    SystemMessage(content=dispatch_sys),
+                    HumanMessage(content=prompt),
+                ]
+                dispatch_res = await asyncio.wait_for(
+                    tool_llm.ainvoke(tool_dispatch_msgs, config={"tags": ["hide_stream"]}),
+                    timeout=5.0,
+                )
+
+                if dispatch_res and hasattr(dispatch_res, "tool_calls") and dispatch_res.tool_calls:
+                    pending_calls = []
+                    for tc in dispatch_res.tool_calls:
+                        args = dict(tc.get("args") or {})
+                        if store_id:
+                            args.setdefault("store_id", store_id)
+                        pending_calls.append({
+                            "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                            "tool_name": tc.get("name"),
+                            "arguments": args,
+                        })
+
+                    LOGGER.info(
+                        "intent_semantic_tool_dispatch_success",
+                        tool_count=len(pending_calls),
+                        tools=[c["tool_name"] for c in pending_calls],
+                    )
+
+                    return {
+                        "user_prompt": prompt,
+                        "intent": "live_data",
+                        "intent_reason": "semantic tools pre-dispatched for 2-LLM-call fast path",
+                        "domains": domains or ["sales"],
+                        "pending_tool_calls": pending_calls,
+                        "memory_query_needed": False,
+                        "user_memory_loaded": True,
+                        "store_memory_loaded": True,
+                        "multi_store_memory_loaded": True,
+                        "requires_planning": False,
+                    }
+        except Exception as dispatch_err:
+            LOGGER.warning("intent_semantic_tool_dispatch_fallback", error=str(dispatch_err)[:200])
+
+    # 9. Standard active business query
     return {
         "user_prompt": prompt,
         "intent": intent,

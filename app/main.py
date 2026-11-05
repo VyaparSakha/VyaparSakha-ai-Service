@@ -158,6 +158,10 @@ async def lifespan(application: FastAPI):
         get_planner_llm()
         get_reasoning_llm()
         get_intent_llm()
+
+        # Pre-load in-memory semantic tool vector index for sub-10ms query matching
+        from app.agent.tools.semantic_index import SemanticToolIndex
+        SemanticToolIndex.get_instance().initialize()
         get_critic_llm()
         get_small_llm()
         get_safeguard_llm()

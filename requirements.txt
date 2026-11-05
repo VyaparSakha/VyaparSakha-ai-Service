@@ -55,4 +55,8 @@ websockets
 
 # Model Context Protocol (MCP) & OAuth
 mcp>=1.2.0,<2
-PyJWT>=2.8.0
+PyJWT>=2.8.0
+
+
+# Fast Local Embeddings for Semantic Tool Retrieval
+fastembed>=0.9.1
