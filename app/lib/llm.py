@@ -155,15 +155,10 @@ _PLANNER_PROVIDERS = [
 # Legacy alias for backward compatibility
 _LARGE_PROVIDERS = _REASONING_PROVIDERS
 
-# 2. Intent Routing (intent_node) - Ultra-fast Gemini Lite / Groq 20B primary, then GPT, Cloudflare GLM fallback
+# 2. Intent Routing (intent_node) - Ultra-fast Gemini Flash / Groq 20B primary, then GPT, Cloudflare GLM fallback
 _INTENT_PROVIDERS = [
-    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
-    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),

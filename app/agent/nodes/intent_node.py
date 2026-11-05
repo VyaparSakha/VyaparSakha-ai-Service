@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import uuid
 from typing import Any, Dict
 
 import structlog
@@ -110,11 +111,17 @@ async def _generate_conversational_reply(state: VyaparAgentState, prompt: str) -
         return f"Namaste {first_name} ji! Main theek hoon. Aapka vyapar kaisa chal raha hai? Sales ya inventory me koi madad chahiye toh batayein."
 
 
+class ToolDispatchCall(BaseModel):
+    tool_name: str = Field(description="Exact tool name from the available candidate tools list")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Dictionary of tool arguments (e.g. {'days_lookback': 30, 'store_id': '...'})")
+
+
 class IntentClassification(BaseModel):
     intent: str = Field(description="The primary intent label: harmful, off_topic, live_data, memory, conversation_recap, mixed, greeting, or general")
     domains: list[str] = Field(default_factory=list, description="Active business domain(s): sales, inventory, forecast, suppliers_purchases, buyers_credit, finance_expenses, billing, documents, communication, automations, insights_overview, web, or [] for conversational")
     requires_planning: bool = Field(default=False, description="True ONLY if the request is complex, multi-step, or strategic requiring a formal step-by-step plan. False for direct data queries like 'tell me about last 30 day sells' or 'low stock alert'")
     reason: str = Field(description="Short operational rationale for the classification and domain selection")
+    tool_calls: list[ToolDispatchCall] = Field(default_factory=list, description="If intent is live_data, list 1 to 3 candidate tools to call with accurate arguments. Empty list for conversational, greeting, memory, or general queries.")
 
 
 def _requires_planning(prompt: str) -> bool:
@@ -226,11 +233,42 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "response_metadata": {"intent": "greeting", "fast_path": True, "generated_by": "intent_llm"},
         }
 
-    # 4. Multi-Tier LLM Classification with automatic fallback (Groq 20B -> Cloudflare GLM -> Gemini)
+    # 4. Fast semantic tool retrieval for candidate tools (in-memory FastEmbed vector search, < 15ms)
+    allowed_semantic_tools = []
+    tools_desc_text = ""
+    is_owner = state.get("is_owner", True)
+    permissions = state.get("permissions", [])
+    store_id = state.get("store_id") or ""
+
+    try:
+        from app.agent.tools.semantic_index import get_semantic_tools_for_query
+        from app.agent.tools.registry import is_tool_allowed_for_user
+
+        matched_tools = get_semantic_tools_for_query(prompt, top_k=4)
+        allowed_semantic_tools = [
+            t for t in matched_tools
+            if is_tool_allowed_for_user(t.name, is_owner=is_owner, permissions=permissions)
+        ]
+        if allowed_semantic_tools:
+            tool_lines = []
+            for t in allowed_semantic_tools:
+                arg_sigs = []
+                for arg_name, arg_info in (t.args or {}).items():
+                    arg_type = arg_info.get("type", "any") if isinstance(arg_info, dict) else "any"
+                    arg_sigs.append(f"{arg_name}: {arg_type}")
+                sig = f"{t.name}({', '.join(arg_sigs)})"
+                desc = t.description.strip().split("\n")[0] if t.description else ""
+                tool_lines.append(f"- {sig}: {desc}")
+            tools_desc_text = "\nAvailable Candidate Tools for this query:\n" + "\n".join(tool_lines) + "\n"
+    except Exception as exc:
+        LOGGER.warning("intent_semantic_candidate_retrieval_failed", error=str(exc)[:150])
+
+    # 5. Single Unified Multi-Tier LLM Call (Intent Classification + Semantic Tool Dispatch in 1 Call)
     intent = None
     reason = ""
     domains: list[str] = []
     requires_planning = False
+    dispatched_tool_calls: list[ToolDispatchCall] = []
 
     llm = get_intent_llm() or get_small_llm()
     if llm and prompt:
@@ -249,13 +287,19 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
                     history_context = "Recent Conversation (last 3 turns):\n" + "\n".join(history_lines) + "\n\n"
 
             classifier = llm.with_structured_output(IntentClassification)
+            user_msg_content = (
+                f"{history_context}"
+                f"Active Store ID: '{store_id}'\n"
+                f"{tools_desc_text}\n"
+                f"Latest User Request: {prompt}"
+            )
             messages_payload = [
                 {"role": "system", "content": INTENT_CLASSIFIER_INSTRUCTION},
-                {"role": "user", "content": f"{history_context}Latest User Request: {prompt}"},
+                {"role": "user", "content": user_msg_content},
             ]
             response = await asyncio.wait_for(
                 classifier.ainvoke(messages_payload, config={"tags": ["hide_stream"]}),
-                timeout=8.0,
+                timeout=12.0,
             )
 
             if response.intent in _VALID_INTENTS:
@@ -263,21 +307,22 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
                 reason = response.reason
                 domains = getattr(response, "domains", []) or []
                 requires_planning = bool(getattr(response, "requires_planning", False))
+                dispatched_tool_calls = getattr(response, "tool_calls", []) or []
             else:
                 intent = "general"
                 reason = "unrecognized intent from LLM"
         except asyncio.TimeoutError:
-            LOGGER.warning("intent_classification_timeout", error="LLM timeout after 8s")
+            LOGGER.warning("intent_classification_timeout", error="LLM timeout after 12s")
         except Exception as e:
             LOGGER.warning("intent_classification_failed", error=str(e)[:200])
 
-    # 5. Deterministic fallback if LLM classification did not yield an intent
+    # 6. Deterministic fallback if LLM classification did not yield an intent
     if not intent:
         intent = _deterministic_intent(prompt) or "general"
         reason = "deterministic fallback routing"
         requires_planning = _requires_planning(prompt)
 
-    # 6. Ensure domain list is populated via pattern detection if empty
+    # 7. Ensure domain list is populated via pattern detection if empty
     if not domains:
         domains = [] if intent in {"greeting", "harmful", "off_topic"} else detect_domains(prompt)
 
@@ -292,9 +337,10 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
         needs_memory=needs_memory,
         prompt_len=len(prompt),
         requires_planning=requires_planning,
+        tool_call_count=len(dispatched_tool_calls),
     )
 
-    # 7. Greeting / Harmful / Off-topic handling
+    # 8. Greeting / Harmful / Off-topic handling
     if intent == "greeting":
         LOGGER.info("intent_greeting_llm_start", prompt=prompt[:50])
         reply = await _generate_conversational_reply(state, prompt)
@@ -340,76 +386,45 @@ async def intent_node(state: VyaparAgentState) -> Dict[str, Any]:
             "response_metadata": {"intent": intent, "fast_path": True, "grader_verdict": intent},
         }
 
-    # 8. Fast-path: Semantic tool retrieval & pre-dispatch for live_data queries (2-LLM-call architecture)
-    if intent == "live_data" and not requires_planning and not needs_memory:
-        try:
-            from app.agent.tools.semantic_index import get_semantic_tools_for_query
-            from app.agent.tools.registry import is_tool_allowed_for_user
-            import uuid
+    # 9. Fast-path: Pre-dispatch tool calls from the unified classification in ONE call
+    allowed_tool_names = {t.name for t in allowed_semantic_tools}
+    if intent == "live_data" and not requires_planning and not needs_memory and dispatched_tool_calls:
+        pending_calls = []
+        for tc in dispatched_tool_calls:
+            t_name = tc.tool_name if hasattr(tc, "tool_name") else tc.get("tool_name")
+            if not t_name:
+                continue
+            if allowed_tool_names and t_name not in allowed_tool_names:
+                continue
+            args = dict(tc.arguments if hasattr(tc, "arguments") else tc.get("arguments") or {})
+            if store_id:
+                args.setdefault("store_id", store_id)
+            pending_calls.append({
+                "call_id": f"call_{uuid.uuid4().hex[:8]}",
+                "tool_name": t_name,
+                "arguments": args,
+            })
 
-            is_owner = state.get("is_owner", True)
-            permissions = state.get("permissions", [])
-            store_id = state.get("store_id")
+        if pending_calls:
+            LOGGER.info(
+                "intent_unified_tool_dispatch_success",
+                tool_count=len(pending_calls),
+                tools=[c["tool_name"] for c in pending_calls],
+            )
+            return {
+                "user_prompt": prompt,
+                "intent": "live_data",
+                "intent_reason": reason or "semantic tools pre-dispatched in single unified LLM call",
+                "domains": domains or ["sales"],
+                "pending_tool_calls": pending_calls,
+                "memory_query_needed": False,
+                "user_memory_loaded": True,
+                "store_memory_loaded": True,
+                "multi_store_memory_loaded": True,
+                "requires_planning": False,
+            }
 
-            # Fast 12ms semantic retrieval of top matching tools
-            matched_tools = get_semantic_tools_for_query(prompt, top_k=4)
-            allowed_semantic_tools = [
-                t for t in matched_tools
-                if is_tool_allowed_for_user(t.name, is_owner=is_owner, permissions=permissions)
-            ]
-
-            if allowed_semantic_tools and llm:
-                LOGGER.info("intent_semantic_tool_dispatch_start", tools=[t.name for t in allowed_semantic_tools])
-                tool_llm = llm.bind_tools(allowed_semantic_tools, tool_choice="any")
-                dispatch_sys = (
-                    f"You are the Vyapar Sakha fast tool dispatcher for store ID '{store_id}'.\n"
-                    f"Given the merchant query, call the required live data tool(s) with accurate arguments.\n"
-                    f"Always pass store_id='{store_id}' if accepted by the tool.\n"
-                    f"For sales/revenue trends or summaries, call both get_sales_summary and get_daily_sales_trend if relevant."
-                )
-                tool_dispatch_msgs = [
-                    SystemMessage(content=dispatch_sys),
-                    HumanMessage(content=prompt),
-                ]
-                dispatch_res = await asyncio.wait_for(
-                    tool_llm.ainvoke(tool_dispatch_msgs, config={"tags": ["hide_stream"]}),
-                    timeout=5.0,
-                )
-
-                if dispatch_res and hasattr(dispatch_res, "tool_calls") and dispatch_res.tool_calls:
-                    pending_calls = []
-                    for tc in dispatch_res.tool_calls:
-                        args = dict(tc.get("args") or {})
-                        if store_id:
-                            args.setdefault("store_id", store_id)
-                        pending_calls.append({
-                            "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
-                            "tool_name": tc.get("name"),
-                            "arguments": args,
-                        })
-
-                    LOGGER.info(
-                        "intent_semantic_tool_dispatch_success",
-                        tool_count=len(pending_calls),
-                        tools=[c["tool_name"] for c in pending_calls],
-                    )
-
-                    return {
-                        "user_prompt": prompt,
-                        "intent": "live_data",
-                        "intent_reason": "semantic tools pre-dispatched for 2-LLM-call fast path",
-                        "domains": domains or ["sales"],
-                        "pending_tool_calls": pending_calls,
-                        "memory_query_needed": False,
-                        "user_memory_loaded": True,
-                        "store_memory_loaded": True,
-                        "multi_store_memory_loaded": True,
-                        "requires_planning": False,
-                    }
-        except Exception as dispatch_err:
-            LOGGER.warning("intent_semantic_tool_dispatch_fallback", error=str(dispatch_err)[:200])
-
-    # 9. Standard active business query
+    # 10. Standard active business query
     return {
         "user_prompt": prompt,
         "intent": intent,
