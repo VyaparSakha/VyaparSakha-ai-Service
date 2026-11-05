@@ -124,26 +124,29 @@ _OPENAI_BASE_URL = {
 }
 
 # 1. Reasoning & Strategic Thinking (think_node, synthesis)
+# Primary: Gemini Flash (fast ~400ms, strong reasoning)
+# Secondary: Groq GPT / OSS (120B, 27B, 20B)
+# Fallback: Cloudflare Workers AI GLM / Gemma, OpenRouter, Ollama
 _REASONING_PROVIDERS = [
-    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("cloudflare", "@cf/google/gemma-4-26b-a4b-it", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
 
-# 1b. Planner Tier (planner_node) - Prioritizes large 120B reasoning models for generating plans
+# 1b. Planner Tier (planner_node) - Prioritizes fast reasoning models for generating plans
 _PLANNER_PROVIDERS = [
-    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
+    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("cloudflare", "@cf/google/gemma-4-26b-a4b-it", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
@@ -152,40 +155,44 @@ _PLANNER_PROVIDERS = [
 # Legacy alias for backward compatibility
 _LARGE_PROVIDERS = _REASONING_PROVIDERS
 
-# 2. Intent Routing (intent_node) - Ultra-fast Groq 20B / Cloudflare GLM primary, Gemini fallback
+# 2. Intent Routing (intent_node) - Ultra-fast Gemini Lite / Groq 20B primary, then GPT, Cloudflare GLM fallback
 _INTENT_PROVIDERS = [
-    ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
-    ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
+    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
+    ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("gemini", "gemini-2.5-flash", _build_gemini, "GEMINI"),
+    ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("cloudflare", "@cf/google/gemma-4-26b-a4b-it", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
 ]
 
 # 3. Critic & Reflection Evaluation (critic_node, reflection_node)
-# Non-Gemini primary (Groq 120B / 20B / Qwen) to conserve Gemini rate limits
+# Groq 120B / 20B / Qwen primary, Gemini Lite, then Cloudflare GLM fallback
 _CRITIC_PROVIDERS = [
     ("groq", "openai/gpt-oss-120b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
-    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "meta-llama/llama-3.3-70b-instruct:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
-    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),  # Emergency tail fallback
 ]
 
 # 4. Fast Auxiliary & Memory (memory extraction, retrieval rerank, conflict resolution, summarizer)
-# Non-Gemini primary: Groq 20B (ultra fast), Groq Qwen 27B, Cloudflare GLM
+# Gemini Flash Lite / Groq 20B primary, then Cloudflare GLM fallback
 _SMALL_PROVIDERS = [
-    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
+    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),
     ("groq", "openai/gpt-oss-20b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
     ("groq", "qwen/qwen3.8-27b", partial(_build_openai, base_url=_OPENAI_BASE_URL["groq"]), "GROQ"),
+    ("cloudflare", "@cf/zai-org/glm-4.7-flash", _build_cloudflare, "CLOUDFLARE_AI"),
     ("openrouter", "google/gemma-2-9b-it:free", partial(_build_openai, base_url=_OPENAI_BASE_URL["openrouter"]), "OPENROUTER"),
     ("ollama", "llama3", _build_ollama, "OLLAMA"),
-    ("gemini", "gemini-2.5-flash-lite", _build_gemini, "GEMINI"),  # Emergency tail fallback
 ]
 
 # 5. Guardrail / Safeguard (grader_node)
@@ -735,8 +742,9 @@ def get_safeguard_llm() -> _FallbackLLM | None:
 
 def clear_llm_cache():
     """Clear all cached LLM chain instances (useful for testing or key rotation)."""
-    global _reasoning_llm_cache, _intent_llm_cache, _critic_llm_cache, _small_llm_cache, _safeguard_llm_cache
+    global _reasoning_llm_cache, _planner_llm_cache, _intent_llm_cache, _critic_llm_cache, _small_llm_cache, _safeguard_llm_cache
     _reasoning_llm_cache = None
+    _planner_llm_cache = None
     _intent_llm_cache = None
     _critic_llm_cache = None
     _small_llm_cache = None
@@ -748,6 +756,7 @@ def get_llm_status() -> dict:
     """Return diagnostic info about which providers and keys are available across groups."""
     groups = {
         "reasoning": _REASONING_PROVIDERS,
+        "planner": _PLANNER_PROVIDERS,
         "intent": _INTENT_PROVIDERS,
         "critic": _CRITIC_PROVIDERS,
         "small": _SMALL_PROVIDERS,
