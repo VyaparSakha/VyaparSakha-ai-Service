@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import time
+import threading
 from pathlib import Path
 from typing import Any, List, Tuple
 import numpy as np
@@ -107,6 +108,7 @@ class SemanticToolIndex:
         self._tool_map: dict[str, BaseTool] = {}
         self._vectors: np.ndarray | None = None
         self._initialized = False
+        self._model_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> SemanticToolIndex:
@@ -115,8 +117,11 @@ class SemanticToolIndex:
         return cls._instance
 
     def initialize(self, tools: list[BaseTool] | None = None) -> None:
-        """Load the embedding model and precompute/load normalized tool vectors in memory."""
-        if self._initialized:
+        """
+        Load normalized tool vectors from disk cache (< 2ms) without blocking on model downloads.
+        If cache is missing, will attempt to initialize the model to compute vectors.
+        """
+        if self._initialized and self._vectors is not None:
             return
 
         t0 = time.perf_counter()
@@ -124,53 +129,83 @@ class SemanticToolIndex:
         self._tool_map = {t.name: t for t in active_tools}
         self._tool_names = [t.name for t in active_tools]
 
-        try:
-            from fastembed import TextEmbedding
-            self._model = TextEmbedding(model_name=self.model_name)
-
-            # Try to load cached vectors from disk
-            if CACHE_FILE_PATH.exists():
-                try:
-                    data = np.load(CACHE_FILE_PATH, allow_pickle=True)
-                    cached_names = list(data["names"])
-                    if cached_names == self._tool_names:
-                        self._vectors = data["vectors"]
-                        self._initialized = True
-                        ms = round((time.perf_counter() - t0) * 1000, 1)
-                        LOGGER.info("semantic_tool_index_loaded_from_disk_cache", tool_count=len(self._tool_names), ms=ms)
-                        return
-                except Exception as cache_exc:
-                    LOGGER.warning("semantic_tool_index_cache_load_failed", error=str(cache_exc))
-
-            # Generate fresh vectors and save to disk
-            LOGGER.info("semantic_tool_index_generating_vectors", tool_count=len(self._tool_names))
-            documents: list[str] = []
-            for name in self._tool_names:
-                tool = self._tool_map[name]
-                desc = tool.description or ""
-                semantic_desc = TOOL_SEMANTIC_DESCRIPTIONS.get(name, "")
-                combined = f"{name}: {semantic_desc} {desc}".strip()
-                documents.append(combined)
-
-            raw_vecs = np.array(list(self._model.embed(documents)), dtype=np.float32)
-            norms = np.linalg.norm(raw_vecs, axis=1, keepdims=True)
-            norms[norms == 0] = 1e-12
-            self._vectors = raw_vecs / norms
-
-            # Cache to disk for instant future loads
+        # 1. Try to load precomputed vectors from disk FIRST for instant (< 2ms) startup
+        if CACHE_FILE_PATH.exists():
             try:
-                np.savez_compressed(CACHE_FILE_PATH, vectors=self._vectors, names=np.array(self._tool_names))
-                LOGGER.info("semantic_tool_index_saved_to_disk_cache", path=str(CACHE_FILE_PATH))
-            except Exception as save_err:
-                LOGGER.warning("semantic_tool_index_save_failed", error=str(save_err))
+                data = np.load(CACHE_FILE_PATH, allow_pickle=True)
+                cached_names = list(data["names"])
+                if cached_names == self._tool_names:
+                    self._vectors = data["vectors"]
+                    self._initialized = True
+                    ms = round((time.perf_counter() - t0) * 1000, 1)
+                    LOGGER.info("semantic_tool_index_loaded_from_disk_cache", tool_count=len(self._tool_names), ms=ms)
+                    return
+            except Exception as cache_exc:
+                LOGGER.warning("semantic_tool_index_cache_load_failed", error=str(cache_exc))
 
-            self._initialized = True
-            ms = round((time.perf_counter() - t0) * 1000, 1)
-            LOGGER.info("semantic_tool_index_initialized", tool_count=len(self._tool_names), ms=ms)
+        # 2. If cache was missing or invalid, generate fresh vectors using model
+        model = self._ensure_model(blocking=True)
+        if model is not None:
+            try:
+                LOGGER.info("semantic_tool_index_generating_vectors", tool_count=len(self._tool_names))
+                documents: list[str] = []
+                for name in self._tool_names:
+                    tool = self._tool_map[name]
+                    desc = tool.description or ""
+                    semantic_desc = TOOL_SEMANTIC_DESCRIPTIONS.get(name, "")
+                    combined = f"{name}: {semantic_desc} {desc}".strip()
+                    documents.append(combined)
 
-        except Exception as exc:
-            LOGGER.error("semantic_tool_index_init_failed", error=str(exc))
-            self._initialized = False
+                raw_vecs = np.array(list(model.embed(documents)), dtype=np.float32)
+                norms = np.linalg.norm(raw_vecs, axis=1, keepdims=True)
+                norms[norms == 0] = 1e-12
+                self._vectors = raw_vecs / norms
+
+                # Cache to disk for instant future loads
+                try:
+                    np.savez_compressed(CACHE_FILE_PATH, vectors=self._vectors, names=np.array(self._tool_names))
+                    LOGGER.info("semantic_tool_index_saved_to_disk_cache", path=str(CACHE_FILE_PATH))
+                except Exception as save_err:
+                    LOGGER.warning("semantic_tool_index_save_failed", error=str(save_err))
+
+                self._initialized = True
+                ms = round((time.perf_counter() - t0) * 1000, 1)
+                LOGGER.info("semantic_tool_index_initialized", tool_count=len(self._tool_names), ms=ms)
+            except Exception as exc:
+                LOGGER.error("semantic_tool_index_vector_gen_failed", error=str(exc))
+                self._initialized = True  # Allow keyword search fallback
+        else:
+            LOGGER.warning("semantic_tool_index_model_unavailable_for_generation")
+            self._initialized = True  # Allow keyword search fallback
+
+    def _ensure_model(self, blocking: bool = True) -> Any | None:
+        """Lazily load or download the FastEmbed model in a thread-safe manner."""
+        if self._model is not None:
+            return self._model
+
+        # If non-blocking or timeout-bounded, avoid hanging HTTP request handlers
+        acquired = self._model_lock.acquire(blocking=blocking, timeout=5.0 if blocking else -1)
+        if not acquired:
+            return None
+
+        try:
+            if self._model is not None:
+                return self._model
+            try:
+                LOGGER.info("semantic_tool_index_loading_model", model_name=self.model_name)
+                from fastembed import TextEmbedding
+                self._model = TextEmbedding(model_name=self.model_name)
+                LOGGER.info("semantic_tool_index_model_loaded", model_name=self.model_name)
+            except Exception as exc:
+                LOGGER.error("semantic_tool_index_model_load_failed", error=str(exc))
+                self._model = None
+            return self._model
+        finally:
+            self._model_lock.release()
+
+    def warmup_model(self) -> None:
+        """Warm up the embedding model (can be safely called in a background worker thread)."""
+        self._ensure_model(blocking=True)
 
     def search(
         self,
@@ -181,8 +216,9 @@ class SemanticToolIndex:
     ) -> list[Tuple[BaseTool, float]]:
         """
         Embed the user query in < 10ms and return top matching BaseTools with hybrid scores.
+        Falls back smoothly to lexical keyword matching if model is not yet loaded or fails.
         """
-        if not self._initialized or self._vectors is None or self._model is None:
+        if not self._initialized or self._vectors is None:
             self.initialize()
             if not self._initialized or self._vectors is None:
                 return self._fallback_keyword_search(query, top_k, allowed_names)
@@ -191,9 +227,14 @@ class SemanticToolIndex:
         if not clean_query:
             return []
 
+        model = self._ensure_model(blocking=True)
+        if model is None:
+            LOGGER.warning("semantic_tool_index_model_not_ready_using_fallback", query=clean_query[:40])
+            return self._fallback_keyword_search(query, top_k, allowed_names)
+
         try:
             t0 = time.perf_counter()
-            q_raw = np.array(list(self._model.embed([clean_query])), dtype=np.float32)[0]
+            q_raw = np.array(list(model.embed([clean_query])), dtype=np.float32)[0]
             q_norm = np.linalg.norm(q_raw)
             if q_norm == 0:
                 return []

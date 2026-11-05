@@ -21,9 +21,13 @@ class CriticResult(BaseModel):
     missing_information: List[str] = Field(description="A list of information that is missing from the answer but required by the goal. Empty if PASS.")
     needs_retry: bool = Field(description="True if the agent should retry to get the missing information.")
 
+def get_llm():
+    return get_critic_llm() or get_small_llm()
+
+
 async def critic_node(state: VyaparAgentState) -> Dict[str, Any]:
     # Use dedicated evaluation model (Groq 120B/20B) — leaves Gemini quota for main thinking
-    llm = get_critic_llm() or get_small_llm()
+    llm = get_llm()
     if not llm:
         return {"goal_status": "complete"}
     

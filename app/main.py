@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 
@@ -144,30 +145,45 @@ async def lifespan(application: FastAPI):
     )
 
     # -----------------------------------------------------------------------
-    # Pre-warm LLM chains to eliminate cold-start delay on first requests
+    # Semantic Tool Vector Index & Non-blocking Pre-warming
     # -----------------------------------------------------------------------
-    try:
-        from app.lib.llm import (
-            get_planner_llm,
-            get_reasoning_llm,
-            get_intent_llm,
-            get_critic_llm,
-            get_small_llm,
-            get_safeguard_llm,
-        )
-        get_planner_llm()
-        get_reasoning_llm()
-        get_intent_llm()
 
-        # Pre-load in-memory semantic tool vector index for sub-10ms query matching
+    # Fast in-memory semantic tool index (< 2ms from disk cache)
+    try:
         from app.agent.tools.semantic_index import SemanticToolIndex
         SemanticToolIndex.get_instance().initialize()
-        get_critic_llm()
-        get_small_llm()
-        get_safeguard_llm()
-        logger.info("llm_chains_prewarmed")
     except Exception as exc:
-        logger.warning("llm_prewarm_failed", error=str(exc))
+        logger.warning("semantic_index_init_failed", error=str(exc))
+
+    # Pre-warm LLM chains and embedding model in a background thread
+    # so Uvicorn binds immediately to the listening port (e.g. port 10000 on Render)
+    # without any synchronous network calls or model downloads blocking the event loop.
+    def _background_warmup_sync():
+        try:
+            from app.lib.llm import (
+                get_planner_llm,
+                get_reasoning_llm,
+                get_intent_llm,
+                get_critic_llm,
+                get_small_llm,
+                get_safeguard_llm,
+            )
+            get_planner_llm()
+            get_reasoning_llm()
+            get_intent_llm()
+            get_critic_llm()
+            get_small_llm()
+            get_safeguard_llm()
+
+            # Warm up / download the FastEmbed model in this worker thread
+            from app.agent.tools.semantic_index import SemanticToolIndex
+            SemanticToolIndex.get_instance().warmup_model()
+
+            logger.info("llm_chains_and_models_prewarmed")
+        except Exception as exc:
+            logger.warning("background_warmup_failed", error=str(exc))
+
+    warmup_task = asyncio.create_task(asyncio.to_thread(_background_warmup_sync))
 
     # -----------------------------------------------------------------------
     # Application is ready
@@ -186,6 +202,13 @@ async def lifespan(application: FastAPI):
         # -------------------------------------------------------------------
         # Shutdown
         # -------------------------------------------------------------------
+
+        if not warmup_task.done():
+            warmup_task.cancel()
+            try:
+                await warmup_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         logger.info(
             "application_shutdown"
@@ -360,4 +383,10 @@ def create_app() -> FastAPI:
 # ---------------------------------------------------------------------------
 
 app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
 
